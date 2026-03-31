@@ -280,14 +280,30 @@ async function getGmailTransport() {
 // ══════════════════════════════════════
 // SEND EMAIL
 // ══════════════════════════════════════
+// Updated /api/email/send endpoint that accepts gmailToken from frontend
 app.post('/api/email/send', async (req, res) => {
   try {
-    const { to, toName, cc, subject, html, attachments } = req.body;
-    // attachments = [{filename, url}]
+    const { to, toName, cc, subject, html, attachments, gmailToken } = req.body;
 
-    const transport = await getGmailTransport();
+    let transport;
+    
+    if (gmailToken) {
+      // Use token passed from frontend (OAuth implicit flow)
+      transport = nodemailer.createTransport({
+        service: 'gmail',
+        auth: {
+          type: 'OAuth2',
+          user: process.env.GMAIL_FROM,
+          clientId: process.env.GMAIL_CLIENT_ID,
+          clientSecret: process.env.GMAIL_CLIENT_SECRET,
+          accessToken: gmailToken,
+        },
+      });
+    } else {
+      // Use stored refresh token from DB
+      transport = await getGmailTransport();
+    }
 
-    // Fetch PDF attachments from Cloudinary URLs
     const mailAttachments = [];
     for (const att of (attachments || [])) {
       if (att.url) {
@@ -298,7 +314,7 @@ app.post('/api/email/send', async (req, res) => {
     await transport.sendMail({
       from: `${process.env.GMAIL_FROM_NAME} <${process.env.GMAIL_FROM}>`,
       to: `${toName} <${to}>`,
-      cc: cc.join(', '),
+      cc: (cc||[]).join(', '),
       subject,
       html,
       attachments: mailAttachments,
@@ -310,6 +326,7 @@ app.post('/api/email/send', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
 
 // ══════════════════════════════════════
 // START
