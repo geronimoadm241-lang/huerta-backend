@@ -306,7 +306,20 @@ app.post('/api/email/send', async (req, res) => {
 
     const mailAttachments = [];
     for (const att of (attachments || [])) {
-      if (att.url) {
+      if (!att.url) continue;
+      if (att.url.startsWith('data:')) {
+        // base64 attachment from browser
+        const matches = att.url.match(/^data:([^;]+);base64,(.+)$/);
+        if (matches) {
+          mailAttachments.push({
+            filename: att.filename,
+            content: matches[2],
+            encoding: 'base64',
+            contentType: matches[1],
+          });
+        }
+      } else {
+        // Cloudinary URL
         mailAttachments.push({ filename: att.filename, path: att.url });
       }
     }
