@@ -291,68 +291,115 @@ app.post('/api/email/send', async (req, res) => {
       return res.status(401).json({ error: 'Gmail token required. Please authorize Gmail in the app.' });
     }
 
-    // Use nodemailer with direct SMTP via Gmail OAuth2 access token
-    // We use 'login' auth type with the access token as password (XOAUTH2)
-    const transport = nodemailer.createTransport({
-      host: 'smtp.gmail.com',
-      port: 465,
-      secure: true,
-      auth: {
-        type: 'OAuth2',
-        user: process.env.GMAIL_FROM,
-        accessToken: gmailToken,
-      },
-    });
+    // Build MIME email with attachments manually and send via Gmail REST API
+    // This avoids nodemailer OAuth2 token refresh issues (nodemailer tries to refresh
+    // the token internally even when you provide an access token directly)
 
-    // Build attachments
-    const mailAttachments = [];
+    const boundary = 'boundary_huerta_' + Date.now();
+    const fromName = process.env.GMAIL_FROM_NAME || 'Huerta Coworking';
+    const fromEmail = process.env.GMAIL_FROM;
+    const ccList = (cc || []).filter(Boolean);
+
+    // Process attachments
+    const attParts = [];
     for (const att of (attachments || [])) {
       const src = att.content || att.url;
       if (!src) continue;
-      
+
+      let b64data, contentType;
+
       if (src.startsWith('data:')) {
-        // base64 data URI - extract content type and data
         const matches = src.match(/^data:([^;]+);base64,(.+)$/s);
         if (matches) {
-          mailAttachments.push({
-            filename: att.filename,
-            content: Buffer.from(matches[2], 'base64'),
-            contentType: matches[1],
-          });
-          console.log('Added base64 attachment:', att.filename, 'size:', matches[2].length);
+          contentType = matches[1];
+          b64data = matches[2].replace(/\s/g, '');
+          console.log('Attachment (base64):', att.filename, 'size:', b64data.length);
         }
       } else {
-        // Cloudinary or external URL - download it
-        mailAttachments.push({ filename: att.filename, path: src });
-        console.log('Added URL attachment:', att.filename, src.substring(0, 80));
+        // Download from URL (Cloudinary etc)
+        console.log('Downloading attachment:', att.filename, src.substring(0, 80));
+        try {
+          const fetch = require('node-fetch');
+          const r = await fetch(src);
+          if (!r.ok) throw new Error('Download failed: ' + r.status);
+          const buf = await r.buffer();
+          b64data = buf.toString('base64');
+          contentType = r.headers.get('content-type') || 'application/pdf';
+          console.log('Downloaded:', att.filename, 'size:', b64data.length);
+        } catch(downloadErr) {
+          console.warn('Failed to download attachment:', att.filename, downloadErr.message);
+          continue;
+        }
+      }
+
+      if (b64data) {
+        attParts.push({ filename: att.filename, contentType, b64data });
       }
     }
 
-    console.log('Total attachments:', mailAttachments.length);
+    console.log('Total attachments:', attParts.length);
 
-    const mailOptions = {
-      from: `${process.env.GMAIL_FROM_NAME} <${process.env.GMAIL_FROM}>`,
-      to: `${toName} <${to}>`,
-      subject,
-      html,
-      attachments: mailAttachments,
-    };
+    // Build multipart MIME message
+    const htmlBase64 = Buffer.from(html, 'utf8').toString('base64');
 
-    // Only add CC if there are recipients
-    const ccList = (cc || []).filter(Boolean);
-    if (ccList.length > 0) {
-      mailOptions.cc = ccList.join(', ');
+    let mimeLines = [
+      `From: ${fromName} <${fromEmail}>`,
+      `To: ${toName} <${to}>`,
+      ccList.length > 0 ? `Cc: ${ccList.join(', ')}` : null,
+      `Subject: =?UTF-8?B?${Buffer.from(subject, 'utf8').toString('base64')}?=`,
+      `MIME-Version: 1.0`,
+      `Content-Type: multipart/mixed; boundary="${boundary}"`,
+      ``,
+      `--${boundary}`,
+      `Content-Type: text/html; charset=UTF-8`,
+      `Content-Transfer-Encoding: base64`,
+      ``,
+      htmlBase64,
+    ].filter(l => l !== null);
+
+    for (const att of attParts) {
+      mimeLines.push(
+        `--${boundary}`,
+        `Content-Type: ${att.contentType}; name="${att.filename}"`,
+        `Content-Transfer-Encoding: base64`,
+        `Content-Disposition: attachment; filename="${att.filename}"`,
+        ``,
+        att.b64data
+      );
     }
 
-    const result = await transport.sendMail(mailOptions);
-    console.log('Email sent:', result.messageId);
-    res.json({ ok: true, messageId: result.messageId });
+    mimeLines.push(`--${boundary}--`);
+
+    const rawEmail = mimeLines.join('\r\n');
+    const encoded = Buffer.from(rawEmail).toString('base64')
+      .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
+
+    // Send via Gmail REST API using the access token directly
+    const fetch = require('node-fetch');
+    const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST',
+      headers: {
+        'Authorization': `Bearer ${gmailToken}`,
+        'Content-Type': 'application/json',
+      },
+      body: JSON.stringify({ raw: encoded }),
+    });
+
+    const gmailData = await gmailRes.json();
+
+    if (!gmailRes.ok) {
+      console.error('Gmail API error:', gmailData);
+      if (gmailRes.status === 401) {
+        return res.status(401).json({ error: 'Gmail token expired or invalid' });
+      }
+      return res.status(500).json({ error: gmailData.error?.message || 'Gmail API error' });
+    }
+
+    console.log('Email sent via Gmail API:', gmailData.id);
+    res.json({ ok: true, messageId: gmailData.id });
+
   } catch (e) {
     console.error('Send error:', e.message, e.stack);
-    // Return 401 specifically for auth errors
-    if (e.message.includes('invalid_grant') || e.message.includes('401') || e.message.includes('Token')) {
-      return res.status(401).json({ error: 'Gmail token expired or invalid' });
-    }
     res.status(500).json({ error: e.message });
   }
 });
