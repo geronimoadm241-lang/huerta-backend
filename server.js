@@ -280,50 +280,51 @@ async function getGmailTransport() {
 // ══════════════════════════════════════
 // SEND EMAIL
 // ══════════════════════════════════════
-// Updated /api/email/send endpoint that accepts gmailToken from frontend
+// Email send endpoint - uses gmailToken from frontend OAuth implicit flow
 app.post('/api/email/send', async (req, res) => {
   try {
     const { to, toName, cc, subject, html, attachments, gmailToken } = req.body;
 
     console.log('Send request:', { to, toName, cc: cc?.length, attachments: attachments?.length, hasToken: !!gmailToken });
 
-    let transport;
-    
-    if (gmailToken) {
-      transport = nodemailer.createTransport({
-        service: 'gmail',
-        auth: {
-          type: 'OAuth2',
-          user: process.env.GMAIL_FROM,
-          clientId: process.env.GMAIL_CLIENT_ID,
-          clientSecret: process.env.GMAIL_CLIENT_SECRET,
-          accessToken: gmailToken,
-        },
-      });
-    } else {
-      transport = await getGmailTransport();
+    if (!gmailToken) {
+      return res.status(401).json({ error: 'Gmail token required. Please authorize Gmail in the app.' });
     }
+
+    // Use nodemailer with direct SMTP via Gmail OAuth2 access token
+    // We use 'login' auth type with the access token as password (XOAUTH2)
+    const transport = nodemailer.createTransport({
+      host: 'smtp.gmail.com',
+      port: 465,
+      secure: true,
+      auth: {
+        type: 'OAuth2',
+        user: process.env.GMAIL_FROM,
+        accessToken: gmailToken,
+      },
+    });
 
     // Build attachments
     const mailAttachments = [];
     for (const att of (attachments || [])) {
-      if (!att.url && !att.content) continue;
+      const src = att.content || att.url;
+      if (!src) continue;
       
-      if (att.url && att.url.startsWith('data:')) {
-        // base64 data URI from browser
-        const matches = att.url.match(/^data:([^;]+);base64,(.+)$/s);
+      if (src.startsWith('data:')) {
+        // base64 data URI - extract content type and data
+        const matches = src.match(/^data:([^;]+);base64,(.+)$/s);
         if (matches) {
           mailAttachments.push({
             filename: att.filename,
             content: Buffer.from(matches[2], 'base64'),
             contentType: matches[1],
           });
-          console.log('Added base64 attachment:', att.filename);
+          console.log('Added base64 attachment:', att.filename, 'size:', matches[2].length);
         }
-      } else if (att.url) {
-        // Cloudinary or external URL
-        mailAttachments.push({ filename: att.filename, path: att.url });
-        console.log('Added URL attachment:', att.filename, att.url.substring(0, 60));
+      } else {
+        // Cloudinary or external URL - download it
+        mailAttachments.push({ filename: att.filename, path: src });
+        console.log('Added URL attachment:', att.filename, src.substring(0, 80));
       }
     }
 
