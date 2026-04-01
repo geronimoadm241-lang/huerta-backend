@@ -217,10 +217,10 @@ app.post('/api/pdfs/factura', upload.single('file'), async (req, res) => {
       ).end(fileBuffer);
     });
 
-    // Update factura with pdf_url
+    // Update factura with pdf_url - match by referencia or pdf filename
     await pool.query(
-      `UPDATE facturas SET pdf_url=$1 WHERE referencia=$2 OR pdf=$3`,
-      [result.secure_url, publicId, fileName]
+      `UPDATE facturas SET pdf_url=$1 WHERE referencia=$2 OR pdf=$3 OR pdf=$4`,
+      [result.secure_url, publicId, fileName, publicId]
     );
 
     res.json({ ok: true, url: result.secure_url, nombre: fileName });
@@ -285,10 +285,11 @@ app.post('/api/email/send', async (req, res) => {
   try {
     const { to, toName, cc, subject, html, attachments, gmailToken } = req.body;
 
+    console.log('Send request:', { to, toName, cc: cc?.length, attachments: attachments?.length, hasToken: !!gmailToken });
+
     let transport;
     
     if (gmailToken) {
-      // Use token passed from frontend (OAuth implicit flow)
       transport = nodemailer.createTransport({
         service: 'gmail',
         auth: {
@@ -300,42 +301,57 @@ app.post('/api/email/send', async (req, res) => {
         },
       });
     } else {
-      // Use stored refresh token from DB
       transport = await getGmailTransport();
     }
 
+    // Build attachments
     const mailAttachments = [];
     for (const att of (attachments || [])) {
-      if (!att.url) continue;
-      if (att.url.startsWith('data:')) {
-        // base64 attachment from browser
-        const matches = att.url.match(/^data:([^;]+);base64,(.+)$/);
+      if (!att.url && !att.content) continue;
+      
+      if (att.url && att.url.startsWith('data:')) {
+        // base64 data URI from browser
+        const matches = att.url.match(/^data:([^;]+);base64,(.+)$/s);
         if (matches) {
           mailAttachments.push({
             filename: att.filename,
-            content: matches[2],
-            encoding: 'base64',
+            content: Buffer.from(matches[2], 'base64'),
             contentType: matches[1],
           });
+          console.log('Added base64 attachment:', att.filename);
         }
-      } else {
-        // Cloudinary URL
+      } else if (att.url) {
+        // Cloudinary or external URL
         mailAttachments.push({ filename: att.filename, path: att.url });
+        console.log('Added URL attachment:', att.filename, att.url.substring(0, 60));
       }
     }
 
-    await transport.sendMail({
+    console.log('Total attachments:', mailAttachments.length);
+
+    const mailOptions = {
       from: `${process.env.GMAIL_FROM_NAME} <${process.env.GMAIL_FROM}>`,
       to: `${toName} <${to}>`,
-      cc: (cc||[]).join(', '),
       subject,
       html,
       attachments: mailAttachments,
-    });
+    };
 
-    res.json({ ok: true });
+    // Only add CC if there are recipients
+    const ccList = (cc || []).filter(Boolean);
+    if (ccList.length > 0) {
+      mailOptions.cc = ccList.join(', ');
+    }
+
+    const result = await transport.sendMail(mailOptions);
+    console.log('Email sent:', result.messageId);
+    res.json({ ok: true, messageId: result.messageId });
   } catch (e) {
-    console.error('Send error:', e.message);
+    console.error('Send error:', e.message, e.stack);
+    // Return 401 specifically for auth errors
+    if (e.message.includes('invalid_grant') || e.message.includes('401') || e.message.includes('Token')) {
+      return res.status(401).json({ error: 'Gmail token expired or invalid' });
+    }
     res.status(500).json({ error: e.message });
   }
 });
