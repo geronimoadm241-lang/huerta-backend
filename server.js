@@ -406,6 +406,14 @@ app.post('/api/email/send', async (req, res) => {
 });
 
 
+// Borrar todas las facturas
+app.post('/api/facturas/borrar-todo', async (req, res) => {
+  try {
+    await pool.query('DELETE FROM facturas');
+    res.json({ ok: true });
+  } catch(e) { res.status(500).json({ error: e.message }) }
+});
+
 // ══════════════════════════════════════
 // START
 // ══════════════════════════════════════
