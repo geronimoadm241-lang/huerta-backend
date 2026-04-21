@@ -161,8 +161,9 @@ app.delete('/api/facturas/:id', async (req, res) => {
 // Mark empresa as sent
 app.post('/api/facturas/marcar-enviado', async (req, res) => {
   try {
-    const { empresa } = req.body;
-    await pool.query('UPDATE facturas SET sent=TRUE WHERE empresa=$1', [empresa]);
+    const { empresa, sent } = req.body;
+    const sentValue = sent === false ? false : true;
+    await pool.query('UPDATE facturas SET sent=$1 WHERE empresa=$2', [sentValue, empresa]);
     res.json({ ok: true });
   } catch (e) { res.status(500).json({ error: e.message }) }
 });
