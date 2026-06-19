@@ -59,8 +59,10 @@ async function initDB() {
       pdf_url TEXT DEFAULT '',
       sede TEXT DEFAULT '',
       sent BOOLEAN DEFAULT FALSE,
+      lista BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     );
+    ALTER TABLE facturas ADD COLUMN IF NOT EXISTS lista BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS pdfs_banco (
       tipo TEXT PRIMARY KEY,
       nombre TEXT,
@@ -131,10 +133,10 @@ app.post('/api/facturas/bulk', async (req, res) => {
     const facturas = req.body;
     for (const f of facturas) {
       await pool.query(`
-        INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent)
+        INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent, lista)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
         ON CONFLICT (id) DO NOTHING
-      `, [f.id, f.empresa, f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha, f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false]);
+      `, [f.id, f.empresa, f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha, f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false, f.lista||false]);
     }
     res.json({ ok: true, count: facturas.length });
   } catch (e) { res.status(500).json({ error: e.message }) }
