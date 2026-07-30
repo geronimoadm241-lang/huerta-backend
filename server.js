@@ -59,10 +59,8 @@ async function initDB() {
       pdf_url TEXT DEFAULT '',
       sede TEXT DEFAULT '',
       sent BOOLEAN DEFAULT FALSE,
-      lista BOOLEAN DEFAULT FALSE,
       created_at TIMESTAMP DEFAULT NOW()
     );
-    ALTER TABLE facturas ADD COLUMN IF NOT EXISTS lista BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS pdfs_banco (
       tipo TEXT PRIMARY KEY,
       nombre TEXT,
@@ -133,10 +131,10 @@ app.post('/api/facturas/bulk', async (req, res) => {
     const facturas = req.body;
     for (const f of facturas) {
       await pool.query(`
-        INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent, lista)
-        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12)
+        INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent)
+        VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
         ON CONFLICT (id) DO NOTHING
-      `, [f.id, f.empresa, f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha, f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false, f.lista||false]);
+      `, [f.id, f.empresa, f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha, f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false]);
     }
     res.json({ ok: true, count: facturas.length });
   } catch (e) { res.status(500).json({ error: e.message }) }
@@ -227,6 +225,21 @@ app.post('/api/pdfs/factura', upload.single('file'), async (req, res) => {
     );
 
     res.json({ ok: true, url: result.secure_url, nombre: fileName });
+  } catch (e) { res.status(500).json({ error: e.message }) }
+});
+
+// ══════════════════════════════════════
+// PDFs FACTURAS — check which refs have Cloudinary URLs
+// ══════════════════════════════════════
+app.get('/api/pdfs/facturas', async (req, res) => {
+  try {
+    const r = await pool.query('SELECT referencia, pdf, pdf_url FROM facturas WHERE pdf_url IS NOT NULL AND pdf_url != ''');
+    const out = {};
+    r.rows.forEach(row => {
+      if(row.referencia) out[row.referencia] = row.pdf_url;
+      if(row.pdf) out[row.pdf.replace('.pdf','')] = row.pdf_url;
+    });
+    res.json(out);
   } catch (e) { res.status(500).json({ error: e.message }) }
 });
 
@@ -378,8 +391,20 @@ app.post('/api/email/send', async (req, res) => {
       .replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
 
     // Send via Gmail REST API using the access token directly
+    // Size check - warn if too large
+    const sizeKB = Math.round(rawEmail.length / 1024);
+    console.log('Email size:', sizeKB, 'KB, attachments:', attParts.length);
+    if(sizeKB > 25000) {
+      console.warn('Email too large:', sizeKB, 'KB');
+      return res.status(400).json({ error: `Email demasiado grande (${sizeKB}KB). Reducí los adjuntos.` });
+    }
+
     const fetch = require('node-fetch');
+    const AbortController = require('abort-controller');
+    const ctrl = new AbortController();
+    const sendTimeout = setTimeout(() => ctrl.abort(), 55000);
     const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      signal: ctrl.signal,
       method: 'POST',
       headers: {
         'Authorization': `Bearer ${gmailToken}`,
@@ -388,6 +413,7 @@ app.post('/api/email/send', async (req, res) => {
       body: JSON.stringify({ raw: encoded }),
     });
 
+    clearTimeout(sendTimeout);
     const gmailData = await gmailRes.json();
 
     if (!gmailRes.ok) {
