@@ -275,7 +275,7 @@ app.post('/api/email/send', async (req, res) => {
     const attParts = [];
     for (const att of (attachments || [])) {
       const src = att.content || att.url;
-      if (!src) continue;
+      if (!src || typeof src !== 'string') continue;
       let b64data, contentType;
       if (src.startsWith('data:')) {
         const matches = src.match(/^data:([^;]+);base64,(.+)$/s);
