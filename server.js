@@ -122,7 +122,7 @@ app.post('/api/facturas/bulk', async (req, res) => {
       await pool.query(`
         INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent, lista)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (id) DO NOTHING
+        ON CONFLICT (id) DO UPDATE SET valor=$5, moneda=$6, fecha=$7, tipo=$8, referencia=$9
       `, [f.id, f.empresa||'', f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha||'', f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false, f.lista||false]);
     }
     res.json({ ok: true, count: facturas.length });
