@@ -324,7 +324,6 @@ app.post('/api/email/send', async (req, res) => {
 
     const encoded = Buffer.from(rawEmail).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
     const fetch = require('node-fetch');
-    const AbortController = require('abort-controller');
     const ctrl = new AbortController();
     const sendTimeout = setTimeout(() => ctrl.abort(), 55000);
     const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
