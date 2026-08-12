@@ -57,6 +57,7 @@ async function initDB() {
     );
     ALTER TABLE facturas ADD COLUMN IF NOT EXISTS lista BOOLEAN DEFAULT FALSE;
     ALTER TABLE facturas ADD COLUMN IF NOT EXISTS pdf_url TEXT DEFAULT '';
+    CREATE UNIQUE INDEX IF NOT EXISTS facturas_referencia_idx ON facturas(referencia) WHERE referencia IS NOT NULL AND referencia != '';
     CREATE TABLE IF NOT EXISTS pdfs_banco (
       tipo TEXT PRIMARY KEY,
       nombre TEXT,
@@ -119,10 +120,18 @@ app.post('/api/facturas/bulk', async (req, res) => {
   try {
     const facturas = req.body;
     for (const f of facturas) {
+      // First try to update by referencia (handles reimports with new ids)
+      if(f.referencia) {
+        const upd = await pool.query(
+          `UPDATE facturas SET valor=$1, moneda=$2, fecha=$3, tipo=$4, empresa=$5 WHERE referencia=$6`,
+          [f.valor||0, f.moneda||'ARS', f.fecha||'', f.tipo||'A', f.empresa||'', f.referencia]
+        );
+        if(upd.rowCount > 0) continue; // Updated existing, skip insert
+      }
       await pool.query(`
         INSERT INTO facturas (id, empresa, contacto, email, valor, moneda, fecha, tipo, referencia, pdf, sede, sent, lista)
         VALUES ($1,$2,$3,$4,$5,$6,$7,$8,$9,$10,$11,$12,$13)
-        ON CONFLICT (id) DO UPDATE SET valor=$5, moneda=$6, fecha=$7, tipo=$8, referencia=$9
+        ON CONFLICT (id) DO UPDATE SET valor=EXCLUDED.valor, moneda=EXCLUDED.moneda, fecha=EXCLUDED.fecha, tipo=EXCLUDED.tipo, empresa=EXCLUDED.empresa
       `, [f.id, f.empresa||'', f.contacto||'', f.email||'', f.valor||0, f.moneda||'ARS', f.fecha||'', f.tipo||'A', f.referencia||'', f.pdf||'', f.sede||'', f.sent||false, f.lista||false]);
     }
     res.json({ ok: true, count: facturas.length });
