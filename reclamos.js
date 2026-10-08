@@ -442,7 +442,10 @@ async function gmailEnviar(token, raw) {
 // ---------- Intereses ----------
 function calcularIntereses(importe, venc, ipc, hoy) {
   const [vy, vm] = venc.split('-').map(Number);
-  const [hy, hm] = hoy.split('-').map(Number);
+  // Hasta el último mes publicado por el INDEC (si no hay ningún dato, hasta el mes actual con la tasa de respaldo)
+  const publicados = Object.keys(ipc).sort();
+  const tope = publicados.length ? publicados[publicados.length - 1] : hoy.slice(0, 7);
+  const [hy, hm] = (tope < hoy.slice(0, 7) ? tope : hoy.slice(0, 7)).split('-').map(Number);
   let y = vy, m = vm + 1; if (m > 12) { m = 1; y++; }
   let factor = 1, meses = 0, usaFallback = false;
   while (y < hy || (y === hy && m <= hm)) {
@@ -453,7 +456,7 @@ function calcularIntereses(importe, venc, ipc, hoy) {
     meses++;
     m++; if (m > 12) { m = 1; y++; }
   }
-  return { meses, interes: r2(importe * (factor - 1)), usaFallback };
+  return { meses, interes: r2(importe * (factor - 1)), usaFallback, hasta: `${hy}-${String(hm).padStart(2, '0')}` };
 }
 
 // ---------- Armado de mails ----------
@@ -607,16 +610,61 @@ module.exports = function montarReclamos(app, pool) {
     try { return r.rows[0] ? JSON.parse(r.rows[0].value) : {}; } catch { return {}; }
   }
 
+  // IPC automático desde la API de series de datos.gob.ar (publica las series del INDEC)
+  const IPC_SERIE = process.env.IPC_SERIE_ID || '148.3_INIVELNAL_DICI_M_26'; // IPC Nivel General Nacional, base dic-2016
+  let ipcUltimoIntento = 0, ipcUltimoError = '';
+  async function actualizarIPC(force = false) {
+    if (!force && Date.now() - ipcUltimoIntento < 6 * 3600e3) return;
+    ipcUltimoIntento = Date.now();
+    const ctrl = new AbortController();
+    const t = setTimeout(() => ctrl.abort(), 12000);
+    try {
+      const url = `https://apis.datos.gob.ar/series/api/series/?ids=${IPC_SERIE}&representation_mode=percent_change&format=json&start_date=2016-12-01&limit=1000`;
+      const r = await fetch(url, { signal: ctrl.signal, headers: { 'User-Agent': 'huerta-backend' } });
+      if (!r.ok) throw new Error('la API respondió HTTP ' + r.status);
+      const d = await r.json();
+      const nuevos = {};
+      for (const [fecha, v] of d.data || []) {
+        if (v == null || !isFinite(v)) continue;
+        const pct = v * 100;
+        if (pct < -5 || pct > 50) continue;
+        nuevos[String(fecha).slice(0, 7)] = Math.round(pct * 10) / 10; // INDEC publica con 1 decimal
+      }
+      const meses = Object.keys(nuevos).sort();
+      if (meses.length < 12) throw new Error('la API no devolvió datos');
+      const actual = await leerIPC();
+      await pool.query(`INSERT INTO config (key, value) VALUES ('ipc', $1) ON CONFLICT (key) DO UPDATE SET value=$1`, [JSON.stringify({ ...actual, ...nuevos })]);
+      await pool.query(`INSERT INTO config (key, value) VALUES ('ipc_fuente', $1) ON CONFLICT (key) DO UPDATE SET value=$1`,
+        [JSON.stringify({ fuente: 'INDEC (datos.gob.ar)', ultimo: meses[meses.length - 1], ts: new Date().toISOString() })]);
+      ipcUltimoError = '';
+      console.log('IPC actualizado hasta', meses[meses.length - 1]);
+    } catch (e) {
+      ipcUltimoError = e.name === 'AbortError' ? 'la API no respondió a tiempo' : e.message;
+      console.warn('IPC: no se pudo actualizar:', ipcUltimoError);
+    } finally { clearTimeout(t); }
+  }
+  setTimeout(() => actualizarIPC(true), 5000);
+
+  app.post('/api/reclamos/ipc/actualizar', admin, async (req, res) => {
+    await actualizarIPC(true);
+    const ipc = await leerIPC();
+    const meses = Object.keys(ipc).sort();
+    res.json({ ok: !ipcUltimoError, error: ipcUltimoError || null, meses: meses.length, ultimo: meses[meses.length - 1] || null });
+  });
+
   // Estado general
   app.get('/api/reclamos/estado', admin, async (req, res) => {
     try {
       const cuenta = await gmailCuenta(pool);
+      await actualizarIPC();
       const ipc = await leerIPC();
       const meses = Object.keys(ipc).sort();
+      const fr = await pool.query(`SELECT value FROM config WHERE key='ipc_fuente'`);
+      const fuente = fr.rows[0] ? JSON.parse(fr.rows[0].value) : null;
       res.json({
         gmail: { conectado: !!cuenta?.refresh_token, email: cuenta?.email || null },
         colppy: { configurado: !!process.env.COLPPY_PASS },
-        ipc: { meses: meses.length, ultimo: meses[meses.length - 1] || null },
+        ipc: { meses: meses.length, ultimo: meses[meses.length - 1] || null, fuente: fuente?.fuente || null, error: ipcUltimoError || null },
       });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
@@ -678,6 +726,7 @@ module.exports = function montarReclamos(app, pool) {
       const tipo = req.body?.tipo;
       if (!['recordatorio', 'reclamo1', 'reclamo2'].includes(tipo)) return res.status(400).json({ error: 'Tipo de mail inválido' });
       const hoy = hoyAR();
+      await actualizarIPC();
       const ipc = await leerIPC();
       const crudas = await colppyFacturasPendientes();
 
@@ -914,6 +963,8 @@ module.exports = function montarReclamos(app, pool) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  const MESES_LARGOS = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+  const pub0 = ipc => { const k = Object.keys(ipc).sort().pop(); return k ? `${MESES_LARGOS[+k.slice(5) - 1]} ${k.slice(0, 4)}` : 'hoy'; };
   // Intereses de mora para facturar (descuenta lo ya facturado)
   async function interesesDeLote(loteId) {
     const mails = await leerLote(loteId);
@@ -941,11 +992,12 @@ module.exports = function montarReclamos(app, pool) {
       const nros = filas.filter(f => f.aFacturar > 0).map(f => f.nro);
       clientes.push({
         idCliente: m.idCliente, empresa: m.empresa, sedes: m.sedes, moneda, filas, totalAFacturar: total,
-        concepto: nros.length ? `Intereses por mora (actualización IPC) s/ facturas ${nros.join(', ')} al ${fechaAR(hoy)}` : '',
+        concepto: nros.length ? `Intereses por mora (actualización IPC hasta ${pub0(ipc)}) s/ facturas ${nros.join(', ')}` : '',
       });
     }
     clientes.sort((a, b) => b.totalAFacturar - a.totalAFacturar);
-    return { hoy, ipcIncompleto, tasaFallback: TASA_FALLBACK, clientes };
+    const pub = Object.keys(ipc).sort();
+    return { hoy, ipcIncompleto, tasaFallback: TASA_FALLBACK, ipcHasta: pub[pub.length - 1] || null, clientes };
   }
 
   app.get('/api/reclamos/intereses', admin, async (req, res) => {
