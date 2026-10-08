@@ -26,6 +26,19 @@ const SEDES = [
 ];
 const sedeDePV = pv => SEDES.find(s => s.pv.includes(pv)) || null;
 
+const BANCOS = {
+  cbu: { nombre: 'Datos bancarios CBU.pdf', moneda: 'ARS', instruccion: 'Para el pago, realizá la transferencia bancaria en pesos al CBU de Huerta Coworking (adjunto).' },
+  merc: { nombre: 'Datos bancarios Mercury.pdf', moneda: 'USD', instruccion: 'Para el pago, realizá la transferencia en dólares a la cuenta Mercury de Huerta Coworking (adjunto).' },
+  bbva_usd: { nombre: 'Datos bancarios BBVA USD.pdf', moneda: 'USD', instruccion: 'Para el pago, realizá la transferencia en dólares a la cuenta BBVA en dólares de Huerta Coworking (adjunto).' },
+};
+const normNombre = t => String(t || '').normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().replace(/[^a-z0-9 ]/g, ' ').replace(/\s+/g, ' ').trim();
+function bancoPorRegla(empresa, reglas) {
+  const n = normNombre(empresa);
+  for (const r of reglas) {
+    if (r.patron.startsWith('=') ? n === normNombre(r.patron.slice(1)) : n.includes(normNombre(r.patron))) return r.banco;
+  }
+  return null;
+}
 const LETRAS = { '0': 'A', '1': 'B', '5': 'I', '6': 'M', '7': 'X', '8': 'T' };
 const SIEMPRE_USD = ['T', 'I', 'M'];
 const DIA_VENCIMIENTO = 10;
@@ -341,7 +354,8 @@ async function buscarUSDenFactura(idFactura) {
 }
 
 // Una sola moneda por cliente: ARS si tiene alguna A o B; si no, USD cuando sus facturas son en dólares
-function monedaCliente(facturas) {
+function monedaCliente(facturas, banco) {
+  if (banco && BANCOS[banco]) return BANCOS[banco].moneda;
   if (facturas.some(f => f.letra === 'A' || f.letra === 'B')) return 'ARS';
   if (facturas.some(f => SIEMPRE_USD.includes(f.letra) || f.usdFactura)) return 'USD';
   return 'ARS';
@@ -471,8 +485,7 @@ const nombreSaludo = c => {
 };
 const nombresAdjuntos = c => [
   ...c.facturas.map(f => `${f.nro}.pdf`),
-  ...(c.totales.ARS > 0 ? ['Datos bancarios CBU'] : []),
-  ...(c.totales.USD > 0 ? ['Datos bancarios Mercury'] : []),
+  (BANCOS[c.banco] || BANCOS[c.totales.USD > 0 ? 'merc' : 'cbu']).nombre,
 ];
 
 function armarHtml(c, adjuntos) {
@@ -536,10 +549,8 @@ function armarHtml(c, adjuntos) {
       + p('Si ya realizaste el pago, por favor respondé este email con el comprobante.');
   }
 
-  const instrucciones = [
-    ...(c.totales.ARS > 0 ? ['Para pagos en pesos, realizá la transferencia bancaria al CBU de Huerta Coworking (adjunto).'] : []),
-    ...(c.totales.USD > 0 ? ['Para pagos en dólares, realizá la transferencia a la cuenta Mercury de Huerta Coworking (adjunto).'] : []),
-  ].map(s => `<div style="font-size:13px;color:#333;margin-top:4px">&bull; ${s}</div>`).join('');
+  const bancoMail = BANCOS[c.banco] ? c.banco : (monedas.includes('USD') ? 'merc' : 'cbu');
+  const instrucciones = `<div style="font-size:13px;color:#333;margin-top:4px">&bull; ${BANCOS[bancoMail].instruccion}</div>`;
 
   const listaAdj = (adjuntos || nombresAdjuntos(c)).map(a =>
     `<span style="display:inline-block;background:#F1EEE8;border-radius:6px;padding:8px 12px;margin:0 6px 6px 0;font-size:12px;font-weight:bold;color:#333">&#128206; ${esc(a)}</span>`).join('');
@@ -602,6 +613,8 @@ module.exports = function montarReclamos(app, pool) {
     CREATE TABLE IF NOT EXISTS reclamos_contactos (id_cliente TEXT PRIMARY KEY, email TEXT, updated_at TIMESTAMPTZ DEFAULT NOW());
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS contacto TEXT;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS excluido BOOLEAN DEFAULT FALSE;
+    ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS banco TEXT;
+    CREATE TABLE IF NOT EXISTS reclamos_bancos_reglas (patron TEXT PRIMARY KEY, banco TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
       interes NUMERIC, factura_interes TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE INDEX IF NOT EXISTS reclamos_intereses_factura ON reclamos_intereses(id_factura);
@@ -758,9 +771,15 @@ module.exports = function montarReclamos(app, pool) {
       // Montos USD: cargados a mano, o buscados dentro de la factura
       const manual = new Map((await pool.query(`SELECT id_factura, usd FROM reclamos_usd`)).rows.map(r => [r.id_factura, +r.usd]));
       const buscar = [];
+      const reglas = (await pool.query(`SELECT patron, banco FROM reclamos_bancos_reglas`)).rows;
+      const bancosEditados = new Map((await pool.query(`SELECT id_cliente, banco FROM reclamos_contactos WHERE banco IS NOT NULL AND banco <> ''`)).rows.map(r => [r.id_cliente, r.banco]));
       for (const c of porCliente.values()) {
         for (const f of c.facturas) if (manual.has(f.idFactura)) { f.usdFactura = manual.get(f.idFactura); f.usdOrigen = 'cargado'; }
-        c.moneda = monedaCliente(c.facturas);
+        const editado = bancosEditados.get(c.idCliente), regla = bancoPorRegla(c.empresa, reglas);
+        c.bancoFijo = BANCOS[editado] ? editado : BANCOS[regla] ? regla : null;
+        c.bancoOrigen = BANCOS[editado] ? 'elegido' : BANCOS[regla] ? 'lista BBVA USD' : 'automático';
+        c.moneda = monedaCliente(c.facturas, c.bancoFijo);
+        c.banco = c.bancoFijo || (c.moneda === 'USD' ? 'merc' : 'cbu');
         if (c.moneda === 'USD') for (const f of c.facturas) if (!f.usdFactura) buscar.push(f);
       }
       for (let i = 0; i < buscar.length; i += 4) {
@@ -814,7 +833,7 @@ module.exports = function montarReclamos(app, pool) {
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
-          idCliente: c.idCliente, moneda: c.moneda, empresa: c.empresa, contacto: mOvrFull.get(c.idCliente)?.contacto || mContacto.get(k) || '',
+          idCliente: c.idCliente, moneda: c.moneda, banco: c.banco, bancoOrigen: c.bancoOrigen, empresa: c.empresa, contacto: mOvrFull.get(c.idCliente)?.contacto || mContacto.get(k) || '',
           excluido: !!mOvrFull.get(c.idCliente)?.excluido, email, emailOrigen: origen, cc,
           sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
           facturas, problemas, bloqueado: yaEnviados.has(c.idCliente),
@@ -922,14 +941,12 @@ module.exports = function montarReclamos(app, pool) {
         if (buf) adjuntos.push({ filename: `${f.nro}.pdf`, buf });
         else sinPdf.push(f.nro);
       }
-      const bancos = await pool.query(`SELECT tipo, nombre, url FROM pdfs_banco`);
-      const banco = Object.fromEntries(bancos.rows.map(r => [r.tipo, r]));
-      for (const [mon, key] of [['ARS', 'cbu'], ['USD', 'merc']]) {
-        if (m.totales[mon] > 0 && banco[key]?.url) {
-          const r = await fetch(banco[key].url);
-          if (r.ok) adjuntos.push({ filename: banco[key].nombre || `Datos bancarios ${mon}.pdf`, buf: Buffer.from(await r.arrayBuffer()) });
-        }
-      }
+      const bancoKey = BANCOS[m.banco] ? m.banco : (m.totales.USD > 0 ? 'merc' : 'cbu');
+      const bq = await pool.query(`SELECT url FROM pdfs_banco WHERE tipo=$1`, [bancoKey]);
+      if (!bq.rows[0]?.url) throw new Error(`Falta subir el PDF de ${BANCOS[bancoKey].nombre.replace('.pdf', '')}`);
+      const rb = await fetch(bq.rows[0].url);
+      if (!rb.ok) throw new Error(`No se pudo descargar ${BANCOS[bancoKey].nombre}`);
+      adjuntos.push({ filename: BANCOS[bancoKey].nombre, buf: Buffer.from(await rb.arrayBuffer()) });
 
       const raw = armarMime({ fromEmail: fromEmail || process.env.GMAIL_FROM, to, toName: m.empresa, cc: m.cc, subject: m.asunto, html: armarHtml(m, adjuntos.map(a => a.filename)), adjuntos });
       if (raw.length > 24 * 1024 * 1024) throw new Error(`El mail de ${m.empresa} supera 24 MB`);
@@ -965,6 +982,21 @@ module.exports = function montarReclamos(app, pool) {
       }
       if (req.body.contacto != null) { cambios.contacto = String(req.body.contacto).trim().slice(0, 80); m.contacto = cambios.contacto; }
       if (req.body.excluido != null) { cambios.excluido = !!req.body.excluido; m.excluido = cambios.excluido; }
+      if (req.body.banco != null) {
+        const b = BANCOS[req.body.banco] ? req.body.banco : '';
+        cambios.banco = b;
+        const moneda = monedaCliente(m.facturas, b || null);
+        m.moneda = moneda;
+        m.banco = b || (moneda === 'USD' ? 'merc' : 'cbu');
+        m.bancoOrigen = b ? 'elegido' : 'automático';
+        for (const f of m.facturas) {
+          if (moneda === 'USD' && !f.usdFactura) {
+            try { const u = await buscarUSDenFactura(f.idFactura); if (u) { f.usdFactura = u.usd; f.usdOrigen = u.origen; } } catch {}
+          }
+          aplicarMoneda(f, moneda);
+        }
+        calcularTotales(m, await leerIPC(), hoyAR());
+      }
       const cols = Object.keys(cambios);
       if (!cols.length) return res.json({ ok: true, mail: m });
       await pool.query(
