@@ -25,6 +25,8 @@ const SEDES = [
 ];
 const sedeDePV = pv => SEDES.find(s => s.pv.includes(pv)) || null;
 
+const LETRAS = { '0': 'A', '1': 'B', '5': 'I', '6': 'M', '7': 'X', '8': 'T' };
+const SIEMPRE_USD = ['T', 'I', 'M'];
 const DIAS_MORA = 90;
 const TASA_FALLBACK = 2; // % mensual si falta el IPC de un mes
 const HORAS_BLOQUEO_REENVIO = 20; // no se reenvía al mismo cliente dentro de este plazo
@@ -289,6 +291,75 @@ async function colppyRaw2(provision, operacion, params) {
   return r.response;
 }
 
+// ---------- Monto USD de facturas T / I / M ----------
+function usdEnTexto(texto) {
+  const t = String(texto || '');
+  const re = /(?:usd|u\$s|us\$|u\$d)\s*:?\s*(\d[\d.,]*)|(\d[\d.,]*)\s*(?:usd|u\$s|us\$|u\$d)\b/gi;
+  let max = null, m;
+  while ((m = re.exec(t))) {
+    const v = parseUSD(`${m[1] || m[2]} usd`);
+    if (v && (max == null || v > max)) max = v;
+  }
+  return max;
+}
+
+async function buscarUSDenFactura(idFactura) {
+  const f = await colppyRaw2('FacturaVenta', 'leer_facturaventa', { idFactura: String(idFactura) });
+  // 1) ítems de la factura
+  let suma = 0, todos = true;
+  for (const it of f.itemsFactura || []) {
+    const u = parseUSD(`${it.Descripcion || ''} ${it.Comentario || ''}`);
+    if (u) suma += u * (+it.Cantidad || 1); else todos = false;
+  }
+  if (suma > 0 && todos) return { usd: r2(suma), origen: 'ítems' };
+  // 2) PDF adjunto en Colppy
+  const adj = await colppyAdjunto(f);
+  if (adj.buf) {
+    try {
+      const pdfjs = require('pdfjs-dist/legacy/build/pdf.js');
+      const doc = await pdfjs.getDocument({ data: new Uint8Array(adj.buf), disableWorker: true, isEvalSupported: false }).promise;
+      let text = '';
+      for (let i = 1; i <= Math.min(doc.numPages, 5); i++) {
+        const c = await (await doc.getPage(i)).getTextContent();
+        text += c.items.map(x => x.str).join(' ') + '\n';
+      }
+      const u = usdEnTexto(text);
+      if (u) return { usd: u, origen: 'PDF' };
+    } catch (e) { console.warn('No se pudo leer el PDF', idFactura, e.message); }
+  }
+  return null;
+}
+
+function aplicarMoneda(f) {
+  if (f.usdFactura) {
+    f.moneda = 'USD';
+    f.importe = r2(f.usdFactura * (f.totalARS ? f.saldoARS / f.totalARS : 1));
+    f.faltaUSD = false;
+  } else if (SIEMPRE_USD.includes(f.letra)) {
+    f.moneda = 'USD'; f.importe = 0; f.faltaUSD = true;
+  } else {
+    f.moneda = 'ARS'; f.importe = f.saldoARS; f.faltaUSD = false;
+  }
+}
+
+function calcularTotales(m, ipc, hoy) {
+  m.totales = { ARS: 0, USD: 0 }; m.intereses = { ARS: 0, USD: 0 };
+  let ipcIncompleto = false;
+  for (const f of m.facturas) {
+    if (f.faltaUSD) continue;
+    m.totales[f.moneda] = r2(m.totales[f.moneda] + f.importe);
+    if (m.tipoMail === 'mora') {
+      const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
+      Object.assign(f, { meses: i.meses, interes: i.interes });
+      m.intereses[f.moneda] = r2(m.intereses[f.moneda] + i.interes);
+      if (i.usaFallback) ipcIncompleto = true;
+    }
+  }
+  m.faltaUSD = m.facturas.some(f => f.faltaUSD);
+  m.problemas = (m.problemas || []).filter(p => !p.startsWith('Faltan meses de IPC'));
+  if (ipcIncompleto) m.problemas.push(`Faltan meses de IPC: se usa ${TASA_FALLBACK}% mensual`);
+}
+
 // ---------- Gmail con refresh token ----------
 function oauthClient() {
   return new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, GMAIL_REDIRECT);
@@ -512,6 +583,7 @@ module.exports = function montarReclamos(app, pool) {
     CREATE UNIQUE INDEX IF NOT EXISTS reclamos_envios_lote_cliente ON reclamos_envios(lote_id, id_cliente);
     CREATE INDEX IF NOT EXISTS reclamos_envios_cliente_fecha ON reclamos_envios(id_cliente, created_at);
     CREATE TABLE IF NOT EXISTS reclamos_contactos (id_cliente TEXT PRIMARY KEY, email TEXT, updated_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS reclamos_usd (id_factura TEXT PRIMARY KEY, nro TEXT, usd NUMERIC, updated_at TIMESTAMPTZ DEFAULT NOW());
   `).then(() => console.log('Reclamos: tablas listas')).catch(e => console.error('Reclamos: error creando tablas', e.message));
 
   async function leerIPC() {
@@ -599,20 +671,35 @@ module.exports = function montarReclamos(app, pool) {
         const total = +f.totalFactura || 0;
         const saldo = r2(total - (+f.totalaplicado || 0));
         if (saldo <= 1) continue;
-        const esAB = f.idTipoFactura === '0' || f.idTipoFactura === '1';
-        const usd = esAB ? null : parseUSD(f.descripcion);
-        const moneda = usd ? 'USD' : 'ARS';
-        const importe = usd ? r2(usd * (total ? saldo / total : 1)) : saldo;
+        const letra = LETRAS[f.idTipoFactura] || '';
+        const esAB = letra === 'A' || letra === 'B';
         const venc = String(f.fechaPago || f.fechaFactura).slice(0, 10);
         const diasVencida = Math.floor((Date.parse(hoy) - Date.parse(venc)) / 86400000);
         const pv = String(f.nroFactura || '').split('-')[0];
         const fac = {
-          idFactura: f.idFactura, nro: f.nroFactura, letra: f.idTipoFactura === '0' ? 'A' : f.idTipoFactura === '1' ? 'B' : '',
-          descripcion: f.descripcion, venc, diasVencida, moneda, importe, tieneCAE: !!f.cae, pv,
+          idFactura: f.idFactura, nro: f.nroFactura, letra, descripcion: f.descripcion, venc, diasVencida,
+          saldoARS: saldo, totalARS: total, usdFactura: esAB ? null : parseUSD(f.descripcion), usdOrigen: '',
+          tieneCAE: !!f.cae, pv,
         };
+        if (fac.usdFactura) fac.usdOrigen = 'concepto';
         if (!porCliente.has(f.idCliente)) porCliente.set(f.idCliente, { idCliente: f.idCliente, empresa: (f.RazonSocial || f.NombreFantasia || '').trim(), facturas: [] });
         porCliente.get(f.idCliente).facturas.push(fac);
       }
+
+      // Montos USD: cargados a mano, o buscados dentro de la factura
+      const manual = new Map((await pool.query(`SELECT id_factura, usd FROM reclamos_usd`)).rows.map(r => [r.id_factura, +r.usd]));
+      const buscar = [];
+      for (const c of porCliente.values()) for (const f of c.facturas) {
+        if (manual.has(f.idFactura)) { f.usdFactura = manual.get(f.idFactura); f.usdOrigen = 'cargado'; }
+        else if (!f.usdFactura && SIEMPRE_USD.includes(f.letra)) buscar.push(f);
+      }
+      for (let i = 0; i < buscar.length; i += 4) {
+        await Promise.all(buscar.slice(i, i + 4).map(async f => {
+          try { const r = await buscarUSDenFactura(f.idFactura); if (r) { f.usdFactura = r.usd; f.usdOrigen = r.origen; } }
+          catch (e) { console.warn('USD no encontrado', f.nro, e.message); }
+        }));
+      }
+      for (const c of porCliente.values()) c.facturas.forEach(aplicarMoneda);
 
       // Emails guardados
       const [ovr, facEm, cliEm] = await Promise.all([
@@ -640,20 +727,8 @@ module.exports = function montarReclamos(app, pool) {
         if (!facturas.length) continue;
         facturas.sort((a, b) => a.venc.localeCompare(b.venc));
 
-        const totales = { ARS: 0, USD: 0 }, intereses = { ARS: 0, USD: 0 };
-        let ipcIncompleto = false;
-        for (const f of facturas) {
-          totales[f.moneda] = r2(totales[f.moneda] + f.importe);
-          if (tipoMail === 'mora') {
-            const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
-            Object.assign(f, { meses: i.meses, interes: i.interes });
-            intereses[f.moneda] = r2(intereses[f.moneda] + i.interes);
-            if (i.usaFallback) ipcIncompleto = true;
-          }
-        }
-
         const k = claveEmpresa(c.empresa);
-        const tieneUSD = totales.USD > 0;
+        const tieneUSD = facturas.some(f => f.moneda === 'USD');
         let email = [], origen = '';
         const candidatos = [
           ['editado', mOvr.get(c.idCliente)],
@@ -664,15 +739,14 @@ module.exports = function montarReclamos(app, pool) {
         const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
         const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
         const problemas = [];
-        if (facturas.some(f => !f.tieneCAE)) problemas.push('Hay facturas sin CAE: puede que no se adjunte su PDF');
-        if (ipcIncompleto) problemas.push(`Faltan meses de IPC: se usa ${TASA_FALLBACK}% mensual`);
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
           idCliente: c.idCliente, empresa: c.empresa, contacto: mContacto.get(k) || '', email, emailOrigen: origen, cc,
           sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
-          facturas, totales, intereses, problemas, bloqueado: yaEnviados.has(c.idCliente),
+          facturas, problemas, bloqueado: yaEnviados.has(c.idCliente),
         };
+        calcularTotales(mail, ipc, hoy);
         if (!email.length) faltanEmail.push(mail);
         mails.push(mail);
       }
@@ -695,7 +769,8 @@ module.exports = function montarReclamos(app, pool) {
 
       const resumen = {
         mails: mails.length,
-        enviables: mails.filter(m => m.email.length && !m.bloqueado).length,
+        enviables: mails.filter(m => m.email.length && !m.bloqueado && !m.faltaUSD).length,
+        faltaUSD: mails.filter(m => m.faltaUSD).length,
         mora: mails.filter(m => m.tipoMail === 'mora').length,
         sinEmail: mails.filter(m => !m.email.length).length,
         totalARS: r2(mails.reduce((s, m) => s + m.totales.ARS, 0)),
@@ -746,6 +821,7 @@ module.exports = function montarReclamos(app, pool) {
         }
       }
       if (!to.length) return res.status(400).json({ error: `${m.empresa} no tiene email` });
+      if (m.facturas.some(f => f.faltaUSD)) return res.status(400).json({ error: `${m.empresa}: falta cargar el monto USD de ${m.facturas.filter(f => f.faltaUSD).map(f => f.nro).join(', ')}` });
 
       // Bloqueo de reenvío: mismo cliente en las últimas horas
       const rec = await pool.query(
@@ -797,6 +873,28 @@ module.exports = function montarReclamos(app, pool) {
     }
   });
 
+  // Cargar a mano el monto USD de una factura
+  app.post('/api/reclamos/usd', admin, async (req, res) => {
+    try {
+      const { loteId, idCliente, idFactura } = req.body || {};
+      const usd = parseUSD(`${req.body?.usd} usd`);
+      if (!usd) return res.status(400).json({ error: 'Monto USD inválido' });
+      const r = await pool.query(`SELECT data FROM reclamos_lotes WHERE id=$1`, [loteId]);
+      if (!r.rows[0]) return res.status(404).json({ error: 'Lote no encontrado. Volvé a buscar facturas.' });
+      const mails = r.rows[0].data;
+      const m = mails.find(x => x.idCliente === idCliente);
+      const f = m?.facturas.find(x => x.idFactura === idFactura);
+      if (!f) return res.status(404).json({ error: 'Factura no está en el lote' });
+      await pool.query(`INSERT INTO reclamos_usd (id_factura, nro, usd, updated_at) VALUES ($1,$2,$3,NOW())
+        ON CONFLICT (id_factura) DO UPDATE SET usd=$3, updated_at=NOW()`, [idFactura, f.nro, usd]);
+      f.usdFactura = usd; f.usdOrigen = 'cargado';
+      aplicarMoneda(f);
+      calcularTotales(m, await leerIPC(), hoyAR());
+      await pool.query(`UPDATE reclamos_lotes SET data=$2 WHERE id=$1`, [loteId, JSON.stringify(mails)]);
+      res.json({ ok: true, mail: m });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // PDF de una factura (se descarga de Colppy en el momento)
   app.get('/api/reclamos/pdf', admin, async (req, res) => {
     try {
@@ -820,4 +918,4 @@ module.exports = function montarReclamos(app, pool) {
   });
 };
 
-module.exports._test = { pdfDesdeDatos, parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
+module.exports._test = { usdEnTexto, pdfDesdeDatos, parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
