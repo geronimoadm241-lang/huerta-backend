@@ -12,6 +12,7 @@ const COLPPY_USER = process.env.COLPPY_USER || 'admin@huertacoworking.com';
 const COLPPY_ID_EMPRESA = process.env.COLPPY_ID_EMPRESA || '82543';
 const GMAIL_REDIRECT = process.env.GMAIL_SERVER_REDIRECT_URI || `${BACKEND_URL}/api/gmail/oauth2callback`;
 const FROM_NAME = process.env.GMAIL_FROM_NAME || 'Huerta Coworking';
+const LOGO_URL = process.env.LOGO_URL || 'https://sistema-cobros-six.vercel.app/logo-huerta.png';
 const TZ = 'America/Argentina/Buenos_Aires';
 
 const CC_FIJOS = ['juan@huertacoworking.com', 'agustin@huertacoworking.com'];
@@ -549,7 +550,7 @@ function armarHtml(c, adjuntos) {
 <table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;${F}border-collapse:collapse">
   <tr><td style="background:#111111;padding:16px 20px">
     <table width="100%" cellpadding="0" cellspacing="0"><tr>
-      <td width="64"><div style="width:64px;height:64px;background:#ffffff;border-radius:8px;text-align:center;line-height:64px;font-size:34px;color:#111;font-family:Georgia,serif">H</div></td>
+      <td width="64"><img src="${LOGO_URL}" width="64" height="64" alt="Huerta Coworking" style="display:block;width:64px;height:64px;border-radius:8px;background:#ffffff;border:0"></td>
       <td style="text-align:center;color:#ffffff;font-size:18px;font-weight:bold">Huerta Coworking</td>
       <td width="110" style="text-align:right">${sede ? `<span style="background:#ffffff;color:#C2410C;font-size:12px;font-weight:bold;padding:5px 10px;border-radius:4px">&#128205; ${esc(sede)}</span>` : ''}</td>
     </tr></table>
