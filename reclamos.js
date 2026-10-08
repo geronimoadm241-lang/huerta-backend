@@ -27,6 +27,15 @@ const sedeDePV = pv => SEDES.find(s => s.pv.includes(pv)) || null;
 
 const LETRAS = { '0': 'A', '1': 'B', '5': 'I', '6': 'M', '7': 'X', '8': 'T' };
 const SIEMPRE_USD = ['T', 'I', 'M'];
+const DIA_VENCIMIENTO = 10;
+// Vence el día 10 del mes de emisión (o del mes siguiente si se emitió después del 10)
+function vencimientoDia10(emision, fechaColppy) {
+  const [y, m, d] = emision.split('-').map(Number);
+  let vy = y, vm = m;
+  if (d > DIA_VENCIMIENTO) { vm++; if (vm > 12) { vm = 1; vy++; } }
+  const v = `${vy}-${String(vm).padStart(2, '0')}-${String(DIA_VENCIMIENTO).padStart(2, '0')}`;
+  return fechaColppy && fechaColppy > v ? fechaColppy : v;
+}
 const DIAS_MORA = 90;
 const TASA_FALLBACK = 2; // % mensual si falta el IPC de un mes
 const HORAS_BLOQUEO_REENVIO = 20; // no se reenvía al mismo cliente dentro de este plazo
@@ -479,19 +488,20 @@ function armarHtml(c, adjuntos) {
     const [bg, fg] = d > 30 ? ['#FBE3E1', ROJO] : ['#FBF0D9', '#B7791F'];
     return `<span style="background:${bg};color:${fg};font-size:11px;font-weight:bold;padding:2px 7px;border-radius:4px">${d}d</span>`;
   };
-  const td = (s, extra = '') => `<td style="padding:12px 14px;border-top:1px solid ${LINEA};font-size:13px;${extra}">${s}</td>`;
-  const th = (s, extra = '') => `<td style="padding:10px 14px;border-top:1px solid ${LINEA};font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};${extra}">${s}</td>`;
+  const td = (s, extra = '') => `<td style="padding:12px 10px;border-top:1px solid ${LINEA};font-size:13px;white-space:nowrap;${extra}">${s}</td>`;
+  const th = (s, extra = '') => `<td style="padding:10px 10px;border-top:1px solid ${LINEA};font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};${extra}">${s}</td>`;
 
   const filas = facturas.map(f => `<tr>
     ${td(esc(f.nro), MONO + 'color:#666')}
-    ${td(fechaLarga(f.venc))}
+    ${td(f.emision ? fechaAR(f.emision) : '-', 'color:#666')}
+    ${td(fechaAR(f.venc))}
     ${td(esc(f.letra || '-'))}
     ${td(fmtCorto(f.importe, f.moneda), MONO + `color:${ROJO};font-weight:bold;text-align:right`)}
     ${mora ? td(fmtCorto(f.interes || 0, f.moneda), MONO + 'text-align:right;color:#666') : ''}
     ${td(badge(f.diasVencida), 'text-align:center')}
   </tr>`).join('');
   const filaTotal = monedas.map(m => `<tr style="background:${BEIGE}">
-    <td colspan="3" style="padding:12px 14px;border-top:1px solid ${LINEA};font-weight:bold;font-size:13px">TOTAL${monedas.length > 1 ? ' ' + m : ''}</td>
+    <td colspan="4" style="padding:12px 14px;border-top:1px solid ${LINEA};font-weight:bold;font-size:13px">TOTAL${monedas.length > 1 ? ' ' + m : ''}</td>
     <td style="padding:12px 14px;border-top:1px solid ${LINEA};${MONO}color:${ROJO};font-weight:bold;text-align:right;font-size:13px">${fmtCorto(c.totales[m], m)}</td>
     ${mora ? `<td style="padding:12px 14px;border-top:1px solid ${LINEA};${MONO}text-align:right;font-size:13px;color:#666">${fmtCorto(c.intereses[m] || 0, m)}</td>` : ''}
     <td style="border-top:1px solid ${LINEA}"></td></tr>`).join('');
@@ -552,8 +562,8 @@ function armarHtml(c, adjuntos) {
   </td></tr>
   <tr><td style="padding:24px 26px 8px">${cuerpo}
     <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${LINEA};border-radius:8px;border-collapse:separate;margin:8px 0 16px;background:#FBFAF8">
-      <tr><td colspan="${mora ? 6 : 5}" style="padding:12px 14px;font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS}">DETALLE DE FACTURAS &middot; ${esc(empresa.toUpperCase())}</td></tr>
-      <tr>${th('REFERENCIA')}${th('VENCIMIENTO')}${th('TIPO')}${th('MONTO', 'text-align:right')}${mora ? th('INTERÉS', 'text-align:right') : ''}${th('ESTADO', 'text-align:center')}</tr>
+      <tr><td colspan="${mora ? 7 : 6}" style="padding:12px 14px;font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS}">DETALLE DE FACTURAS &middot; ${esc(empresa.toUpperCase())}</td></tr>
+      <tr>${th('REFERENCIA')}${th('EMISIÓN')}${th('VENCIMIENTO')}${th('TIPO')}${th('MONTO', 'text-align:right')}${mora ? th('INTERÉS', 'text-align:right') : ''}${th('ESTADO', 'text-align:center')}</tr>
       ${filas}${filaTotal}
     </table>
     <div style="border:1px solid #BFE0C3;background:#EEF8EF;border-radius:8px;padding:14px 16px;margin-bottom:20px">
@@ -676,11 +686,12 @@ module.exports = function montarReclamos(app, pool) {
         if (saldo <= 1) continue;
         const letra = LETRAS[f.idTipoFactura] || '';
         const esAB = letra === 'A' || letra === 'B';
-        const venc = String(f.fechaPago || f.fechaFactura).slice(0, 10);
+        const emision = String(f.fechaFactura).slice(0, 10);
+        const venc = vencimientoDia10(emision, String(f.fechaPago || '').slice(0, 10));
         const diasVencida = Math.floor((Date.parse(hoy) - Date.parse(venc)) / 86400000);
         const pv = String(f.nroFactura || '').split('-')[0];
         const fac = {
-          idFactura: f.idFactura, nro: f.nroFactura, letra, descripcion: f.descripcion, venc, diasVencida,
+          idFactura: f.idFactura, nro: f.nroFactura, letra, descripcion: f.descripcion, emision, venc, diasVencida,
           saldoARS: saldo, totalARS: total, usdFactura: esAB ? null : parseUSD(f.descripcion), usdOrigen: '',
           tieneCAE: !!f.cae, pv,
         };
