@@ -903,6 +903,7 @@ module.exports = function montarReclamos(app, pool) {
       if (rec.rowCount) return res.json({ ok: true, omitido: true, motivo: 'Ya se le envió un mail recientemente' });
 
       // Reserva: un solo intento por cliente y lote (evita doble click o reintentos)
+      await pool.query(`DELETE FROM reclamos_envios WHERE lote_id=$1 AND id_cliente=$2 AND estado='error'`, [loteId, idCliente]);
       const ins = await pool.query(
         `INSERT INTO reclamos_envios (lote_id, id_cliente, empresa, email, tipo_mail, facturas, estado)
          VALUES ($1,$2,$3,$4,$5,$6,'enviando') ON CONFLICT (lote_id, id_cliente) DO NOTHING`,
