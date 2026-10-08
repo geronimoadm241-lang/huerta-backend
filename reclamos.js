@@ -127,9 +127,9 @@ async function colppyEmailCliente(idCliente) {
   } catch { return []; }
 }
 
-let ultimoErrorPdf = '';
+let ultimoErrorPdf = '', ultimoOrigenPdf = '';
 async function colppyPdfFactura(idFactura, idCliente) {
-  ultimoErrorPdf = '';
+  ultimoErrorPdf = ''; ultimoOrigenPdf = '';
   for (const force of [false, true]) {
     const s = await colppyGetSesion(force);
     const q = new URLSearchParams({ usuario: s.usuario, claveSesion: s.claveSesion, idEmpresa: COLPPY_ID_EMPRESA, idFactura: String(idFactura), idCliente: String(idCliente) });
@@ -143,9 +143,9 @@ async function colppyPdfFactura(idFactura, idCliente) {
       });
       const buf = Buffer.from(await r.arrayBuffer());
       const inicio = buf.subarray(0, 4096).indexOf('%PDF');
-      if (r.ok && inicio >= 0) return inicio ? buf.subarray(inicio) : buf;
+      if (r.ok && inicio >= 0) { ultimoOrigenPdf = 'electronica'; return inicio ? buf.subarray(inicio) : buf; }
       if (/no es electr/i.test(buf.toString('utf8'))) {
-        try { return await colppyPdfGenerado(idFactura, idCliente); }
+        try { return await colppyPdfNoElectronica(idFactura, idCliente); }
         catch (e) { ultimoErrorPdf = 'Factura no electrónica y no se pudo generar el PDF: ' + e.message; return null; }
       }
       ultimoErrorPdf = `HTTP ${r.status}, tipo ${r.headers.get('content-type') || '?'}, ${buf.length} bytes: ` +
@@ -240,12 +240,43 @@ function pdfDesdeDatos(info, items, cliente) {
   });
 }
 
-async function colppyPdfGenerado(idFactura, idCliente) {
-  const [f, cliente] = await Promise.all([
-    colppyRaw2('FacturaVenta', 'leer_facturaventa', { idFactura: String(idFactura) }),
-    colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) }).catch(() => ({})),
-  ]);
+const COLPPY_ADJ_URL = 'https://login.colppy.com/resources/Provisiones/ColppyCommon/common/FileManagement/DownloadArchivoComprobante.php';
+const UA = { 'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36', 'Accept': 'application/pdf,*/*;q=0.8' };
+
+// Baja el PDF adjunto a la factura en Colppy (el que se ve en "Archivos")
+async function colppyAdjunto(f) {
+  const info = f.infofactura || {};
+  if (!f.archivoId || !f.nombreArchivo) return { detalle: 'la factura no tiene archivo adjunto en Colppy' };
+  let detalle = '';
+  for (const force of [false, true]) {
+    const s = await colppyGetSesion(force);
+    const q = new URLSearchParams({
+      idEmpresa: COLPPY_ID_EMPRESA, idUsuario: s.usuario, tipoComprobante: 'FAV',
+      idComprobante: String(info.idFactura), nombreArchivo: f.nombreArchivo, idArchivo: String(f.archivoId),
+      usuario: s.usuario, claveSesion: s.claveSesion,
+    });
+    try {
+      const r = await fetch(`${COLPPY_ADJ_URL}?${q}`, { redirect: 'follow', headers: UA });
+      const buf = Buffer.from(await r.arrayBuffer());
+      const ini = buf.subarray(0, 4096).indexOf('%PDF');
+      if (r.ok && ini >= 0) return { buf: ini ? buf.subarray(ini) : buf };
+      detalle = `adjunto: HTTP ${r.status}, ${r.headers.get('content-type') || '?'}, ${buf.length} bytes: ` +
+        buf.subarray(0, 160).toString('utf8').replace(/\s+/g, ' ').trim();
+    } catch (e) { detalle = 'adjunto: error de red ' + e.message; }
+  }
+  console.warn('Adjunto Colppy falló', info.nroFactura, detalle);
+  return { detalle };
+}
+
+// Facturas no electrónicas: primero el adjunto original, si no, PDF generado con los datos de Colppy
+async function colppyPdfNoElectronica(idFactura, idCliente) {
+  const f = await colppyRaw2('FacturaVenta', 'leer_facturaventa', { idFactura: String(idFactura) });
   if (!f?.infofactura) throw new Error('Colppy no devolvió los datos de la factura');
+  const adj = await colppyAdjunto(f);
+  if (adj.buf) { ultimoOrigenPdf = 'adjunto'; return adj.buf; }
+  const cliente = await colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) }).catch(() => ({}));
+  ultimoOrigenPdf = 'generado';
+  ultimoErrorPdf = adj.detalle;
   return pdfDesdeDatos(f.infofactura, f.itemsFactura || [], cliente || {});
 }
 
@@ -774,6 +805,9 @@ module.exports = function montarReclamos(app, pool) {
       const buf = await colppyPdfFactura(idFactura, idCliente);
       if (!buf) return res.status(404).json({ error: 'Colppy no devolvió el PDF. Detalle: ' + (ultimoErrorPdf || 'sin datos') });
       res.set('Content-Type', 'application/pdf');
+      res.set('X-Pdf-Origen', ultimoOrigenPdf || '');
+      res.set('X-Pdf-Detalle', encodeURIComponent(ultimoOrigenPdf === 'generado' ? ultimoErrorPdf : ''));
+      res.set('Access-Control-Expose-Headers', 'X-Pdf-Origen, X-Pdf-Detalle');
       res.send(buf);
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
