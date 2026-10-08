@@ -127,16 +127,30 @@ async function colppyEmailCliente(idCliente) {
   } catch { return []; }
 }
 
+let ultimoErrorPdf = '';
 async function colppyPdfFactura(idFactura, idCliente) {
+  ultimoErrorPdf = '';
   for (const force of [false, true]) {
     const s = await colppyGetSesion(force);
     const q = new URLSearchParams({ usuario: s.usuario, claveSesion: s.claveSesion, idEmpresa: COLPPY_ID_EMPRESA, idFactura: String(idFactura), idCliente: String(idCliente) });
     try {
-      const r = await fetch(`${COLPPY_PDF_URL}?${q}`);
-      if (!r.ok) continue;
+      const r = await fetch(`${COLPPY_PDF_URL}?${q}`, {
+        redirect: 'follow',
+        headers: {
+          'User-Agent': 'Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36',
+          'Accept': 'application/pdf,text/html;q=0.9,*/*;q=0.8',
+        },
+      });
       const buf = Buffer.from(await r.arrayBuffer());
-      if (buf.subarray(0, 4).toString() === '%PDF') return buf;
-    } catch { /* reintenta con sesión nueva */ }
+      const inicio = buf.subarray(0, 4096).indexOf('%PDF');
+      if (r.ok && inicio >= 0) return inicio ? buf.subarray(inicio) : buf;
+      ultimoErrorPdf = `HTTP ${r.status}, tipo ${r.headers.get('content-type') || '?'}, ${buf.length} bytes: ` +
+        buf.subarray(0, 160).toString('utf8').replace(/\s+/g, ' ').trim();
+      console.warn('PDF Colppy falló', idFactura, ultimoErrorPdf);
+    } catch (e) {
+      ultimoErrorPdf = 'Error de red: ' + e.message;
+      console.warn('PDF Colppy error', idFactura, e.message);
+    }
   }
   return null;
 }
@@ -655,7 +669,7 @@ module.exports = function montarReclamos(app, pool) {
       const { idFactura, idCliente } = req.query;
       if (!/^\d+$/.test(idFactura || '') || !/^\d+$/.test(idCliente || '')) return res.status(400).json({ error: 'Factura inválida' });
       const buf = await colppyPdfFactura(idFactura, idCliente);
-      if (!buf) return res.status(404).json({ error: 'Colppy no generó el PDF de esta factura (puede no tener CAE)' });
+      if (!buf) return res.status(404).json({ error: 'Colppy no devolvió el PDF. Detalle: ' + (ultimoErrorPdf || 'sin datos') });
       res.set('Content-Type', 'application/pdf');
       res.send(buf);
     } catch (e) { res.status(500).json({ error: e.message }); }
