@@ -1,0 +1,583 @@
+// Reclamos automáticos: lee facturas pendientes de Colppy, arma un mail por cliente
+// y lo envía por Gmail con refresh token (no hace falta renovar el token a mano).
+const crypto = require('crypto');
+const { google } = require('googleapis');
+
+// ---------- Configuración ----------
+const BACKEND_URL = (process.env.BACKEND_URL || 'https://huerta-backend.onrender.com').replace(/\/$/, '');
+const ADMIN_KEY = (process.env.ADMIN_KEY || '').trim();
+const COLPPY_URL = process.env.COLPPY_URL || 'https://login.colppy.com/lib/frontera2/service.php';
+const COLPPY_PDF_URL = 'https://login.colppy.com/resources/Provisiones/ColppyCommon/GenerarFactura.php';
+const COLPPY_USER = process.env.COLPPY_USER || 'admin@huertacoworking.com';
+const COLPPY_ID_EMPRESA = process.env.COLPPY_ID_EMPRESA || '82543';
+const GMAIL_REDIRECT = process.env.GMAIL_SERVER_REDIRECT_URI || `${BACKEND_URL}/api/gmail/oauth2callback`;
+const FROM_NAME = process.env.GMAIL_FROM_NAME || 'Huerta Coworking';
+const TZ = 'America/Argentina/Buenos_Aires';
+
+const CC_FIJOS = ['juan@huertacoworking.com', 'agustin@huertacoworking.com'];
+const SEDES = [
+  { sede: 'Humboldt', cc: 'solange@huertacoworking.com', pv: ['0019', '0021', '0014', '0018', '0024', '0022', '0027'] },
+  { sede: 'Microcentro', cc: 'rocio@huertacoworking.com', pv: ['0012', '0013', '0017', '0015', '0026'] },
+  { sede: 'Dorrego', cc: 'melisa@huertacoworking.com', pv: ['0008', '0020', '0016', '0011'] },
+  { sede: 'H2', cc: 'solange@huertacoworking.com', pv: ['0028'] },
+  { sede: 'P. Retiro', cc: 'rocio@huertacoworking.com', pv: ['0023', '0029', '0030'] },
+  { sede: '25 de Mayo', cc: 'rocio@huertacoworking.com', pv: ['0031'] },
+];
+const sedeDePV = pv => SEDES.find(s => s.pv.includes(pv)) || null;
+
+const DIAS_MORA = 90;
+const TASA_FALLBACK = 2; // % mensual si falta el IPC de un mes
+const HORAS_BLOQUEO_REENVIO = 20; // no se reenvía al mismo cliente dentro de este plazo
+const MAX_MAILS_POR_LOTE = 200;
+const LOTE_VALIDO_HORAS = 6;
+
+const TIPOS = {
+  recordatorio: { label: 'Recordatorio día 8', asunto: () => 'Factura próxima a vencer · Huerta Coworking' },
+  reclamo1: { label: 'Reclamo día 15', asunto: () => 'Factura pendiente de pago · Huerta Coworking' },
+  reclamo2: { label: 'Segundo aviso día 20', asunto: () => 'Segundo aviso · Factura pendiente · Huerta Coworking' },
+  mora: { label: 'Mora +90 días', asunto: emp => `URGENTE: Deuda en mora · ${emp} · Cuenta en revisión` },
+};
+
+// ---------- Utilidades ----------
+const hoyAR = () => new Date().toLocaleDateString('en-CA', { timeZone: TZ }); // YYYY-MM-DD
+const md5 = s => crypto.createHash('md5').update(s).digest('hex');
+const esc = s => String(s ?? '').replace(/[&<>"']/g, c => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const r2 = n => Math.round(n * 100) / 100;
+const fmt = (n, moneda) => moneda === 'USD'
+  ? 'USD ' + n.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 })
+  : '$ ' + n.toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+const fechaAR = iso => { const [y, m, d] = String(iso).slice(0, 10).split('-'); return `${d}/${m}/${y}`; };
+const EMAIL_RE = /^[^\s@,;]+@[^\s@,;]+\.[^\s@,;]+$/;
+const limpiarEmails = s => [...new Set(String(s || '').split(/[;,\s]+/).map(e => e.trim().toLowerCase()).filter(e => EMAIL_RE.test(e)))];
+const claveEmpresa = s => String(s || '').trim().toLowerCase().replace(/\s+/g, ' ');
+
+function parseUSD(desc) {
+  const t = String(desc || '');
+  const m = t.match(/(\d[\d.,]*)\s*(?:usd|u\$s|us\$|d[oó]lares)/i) || t.match(/(?:usd|u\$s|us\$)\s*(\d[\d.,]*)/i);
+  if (!m) return null;
+  let s = m[1].replace(/[.,]$/, '');
+  if (s.includes('.') && s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
+  else if (s.includes(',')) s = s.replace(',', '.');
+  else if (/\.\d{3}$/.test(s)) s = s.replace(/\./g, '');
+  const n = parseFloat(s);
+  return isFinite(n) && n > 0 ? n : null;
+}
+
+// ---------- Colppy ----------
+let colppySesion = null, colppySesionTs = 0;
+
+async function colppyRaw(provision, operacion, parameters) {
+  const r = await fetch(COLPPY_URL, {
+    method: 'POST',
+    headers: { 'Content-Type': 'application/json' },
+    body: JSON.stringify({
+      auth: { usuario: COLPPY_USER, password: md5(process.env.COLPPY_PASS || '') },
+      service: { provision, operacion },
+      parameters,
+    }),
+  });
+  return r.json();
+}
+const colppyFallo = r => (r?.result?.estado ?? 0) !== 0 || r?.response?.success === false;
+
+async function colppyGetSesion(force = false) {
+  if (colppySesion && !force && Date.now() - colppySesionTs < 8 * 3600e3) return colppySesion;
+  if (!process.env.COLPPY_PASS) throw new Error('Falta la variable COLPPY_PASS en Render');
+  const r = await colppyRaw('Usuario', 'iniciar_sesion', { usuario: COLPPY_USER, password: md5(process.env.COLPPY_PASS) });
+  const d = r?.response?.data;
+  if (!d?.claveSesion) throw new Error('No se pudo iniciar sesión en Colppy: ' + JSON.stringify(r?.result || r).slice(0, 200));
+  colppySesion = { usuario: COLPPY_USER, claveSesion: d.claveSesion };
+  colppySesionTs = Date.now();
+  return colppySesion;
+}
+
+async function colppy(provision, operacion, params = {}) {
+  const build = async force => ({ sesion: await colppyGetSesion(force), idEmpresa: COLPPY_ID_EMPRESA, ...params });
+  let r = await colppyRaw(provision, operacion, await build(false));
+  if (colppyFallo(r) && /sesi/i.test(JSON.stringify(r?.result || '') + (r?.response?.message || ''))) {
+    r = await colppyRaw(provision, operacion, await build(true));
+  }
+  if (colppyFallo(r)) throw new Error(`Colppy ${provision}/${operacion}: ${r?.response?.message || r?.result?.mensaje || 'error'}`);
+  return r.response.data;
+}
+
+async function colppyFacturasPendientes() {
+  const out = [];
+  for (let start = 0; ; start += 1000) {
+    const data = await colppy('FacturaVenta', 'listar_facturasventa', {
+      filter: [
+        { field: 'idEstadoFactura', op: '=', value: '3' }, // 3 = pendiente de cobro
+        { field: 'idTipoComprobante', op: '=', value: '4' }, // 4 = factura (excluye notas de crédito)
+        { field: 'fechaFactura', op: '<=', value: hoyAR() }, // excluye facturas emitidas a futuro
+      ],
+      order: { field: ['fechaFactura'], order: 'asc' },
+      start, limit: 1000,
+    });
+    const arr = Array.isArray(data) ? data : [];
+    out.push(...arr);
+    if (arr.length < 1000) break;
+  }
+  return out;
+}
+
+async function colppyEmailCliente(idCliente) {
+  try {
+    const d = await colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) });
+    return limpiarEmails(d?.Email);
+  } catch { return []; }
+}
+
+async function colppyPdfFactura(idFactura, idCliente) {
+  for (const force of [false, true]) {
+    const s = await colppyGetSesion(force);
+    const q = new URLSearchParams({ usuario: s.usuario, claveSesion: s.claveSesion, idEmpresa: COLPPY_ID_EMPRESA, idFactura: String(idFactura), idCliente: String(idCliente) });
+    try {
+      const r = await fetch(`${COLPPY_PDF_URL}?${q}`);
+      if (!r.ok) continue;
+      const buf = Buffer.from(await r.arrayBuffer());
+      if (buf.subarray(0, 4).toString() === '%PDF') return buf;
+    } catch { /* reintenta con sesión nueva */ }
+  }
+  return null;
+}
+
+// ---------- Gmail con refresh token ----------
+function oauthClient() {
+  return new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, GMAIL_REDIRECT);
+}
+const oauthStates = new Map(); // state -> timestamp
+
+async function gmailCuenta(pool) {
+  const r = await pool.query(`SELECT value FROM config WHERE key='gmail_refresh'`);
+  return r.rows[0] ? JSON.parse(r.rows[0].value) : null;
+}
+
+async function gmailAccessToken(pool) {
+  const cuenta = await gmailCuenta(pool);
+  if (!cuenta?.refresh_token) throw Object.assign(new Error('Gmail no está conectado'), { code: 'GMAIL' });
+  const c = oauthClient();
+  c.setCredentials({ refresh_token: cuenta.refresh_token });
+  try {
+    const { token } = await c.getAccessToken();
+    if (!token) throw new Error('sin token');
+    return { token, email: cuenta.email };
+  } catch (e) {
+    throw Object.assign(new Error('Gmail perdió la autorización. Volvé a conectarlo.'), { code: 'GMAIL' });
+  }
+}
+
+function armarMime({ fromEmail, to, toName, cc, subject, html, adjuntos }) {
+  const boundary = 'huerta_' + crypto.randomBytes(8).toString('hex');
+  const enc = s => `=?UTF-8?B?${Buffer.from(s, 'utf8').toString('base64')}?=`;
+  const lines = [
+    `From: ${enc(FROM_NAME)} <${fromEmail}>`,
+    `To: ${enc(toName)} <${to[0]}>${to.slice(1).map(e => `, <${e}>`).join('')}`,
+    cc.length ? `Cc: ${cc.join(', ')}` : null,
+    `Subject: ${enc(subject)}`,
+    'MIME-Version: 1.0',
+    `Content-Type: multipart/mixed; boundary="${boundary}"`,
+    '',
+    `--${boundary}`,
+    'Content-Type: text/html; charset=UTF-8',
+    'Content-Transfer-Encoding: base64',
+    '',
+    Buffer.from(html, 'utf8').toString('base64').replace(/.{76}/g, '$&\r\n'),
+  ].filter(l => l !== null);
+  for (const a of adjuntos) {
+    lines.push(`--${boundary}`,
+      `Content-Type: application/pdf; name="${enc(a.filename)}"`,
+      'Content-Transfer-Encoding: base64',
+      `Content-Disposition: attachment; filename="${enc(a.filename)}"`,
+      '', a.buf.toString('base64').replace(/.{76}/g, '$&\r\n'));
+  }
+  lines.push(`--${boundary}--`);
+  return lines.join('\r\n');
+}
+
+async function gmailEnviar(token, raw) {
+  const ctrl = new AbortController();
+  const t = setTimeout(() => ctrl.abort(), 55000);
+  try {
+    const r = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
+      method: 'POST', signal: ctrl.signal,
+      headers: { Authorization: `Bearer ${token}`, 'Content-Type': 'application/json' },
+      body: JSON.stringify({ raw: Buffer.from(raw).toString('base64url') }),
+    });
+    const d = await r.json();
+    if (!r.ok) throw Object.assign(new Error(d?.error?.message || 'Error de Gmail'), { code: r.status === 401 ? 'GMAIL' : undefined });
+    return d.id;
+  } finally { clearTimeout(t); }
+}
+
+// ---------- Intereses ----------
+function calcularIntereses(importe, venc, ipc, hoy) {
+  const [vy, vm] = venc.split('-').map(Number);
+  const [hy, hm] = hoy.split('-').map(Number);
+  let y = vy, m = vm + 1; if (m > 12) { m = 1; y++; }
+  let factor = 1, meses = 0, usaFallback = false;
+  while (y < hy || (y === hy && m <= hm)) {
+    const k = `${y}-${String(m).padStart(2, '0')}`;
+    const tasa = ipc[k];
+    if (tasa == null) usaFallback = true;
+    factor *= 1 + (tasa ?? TASA_FALLBACK) / 100;
+    meses++;
+    m++; if (m > 12) { m = 1; y++; }
+  }
+  return { meses, interes: r2(importe * (factor - 1)), usaFallback };
+}
+
+// ---------- Armado de mails ----------
+function armarHtml(c) {
+  const { tipoMail, empresa, facturas } = c;
+  const mora = tipoMail === 'mora';
+  const filas = facturas.map(f => `
+    <tr>
+      <td style="padding:8px;border-bottom:1px solid #e5e5e5">${esc(f.nro)}</td>
+      <td style="padding:8px;border-bottom:1px solid #e5e5e5">${fechaAR(f.venc)}</td>
+      <td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${fmt(f.importe, f.moneda)}</td>
+      ${mora ? `<td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${f.meses || 0}</td>
+      <td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${fmt(f.interes || 0, f.moneda)}</td>` : ''}
+    </tr>`).join('');
+  const th = s => `<th style="padding:8px;text-align:left;background:#f3f5f2;border-bottom:1px solid #d5d9d3">${s}</th>`;
+  const tabla = `<table style="border-collapse:collapse;width:100%;font-size:14px;margin:16px 0">
+    <tr>${th('Factura')}${th('Vencimiento')}${th('Importe')}${mora ? th('Meses') + th('Interés') : ''}</tr>${filas}</table>`;
+
+  const totales = m => {
+    const lista = ['ARS', 'USD'].filter(mon => c.totales[mon] > 0);
+    return lista.map(mon => m(mon)).join('<br>');
+  };
+
+  let intro, cierre;
+  if (tipoMail === 'recordatorio') {
+    intro = `<p>Les recordamos que tienen facturas pendientes con Huerta Coworking. Las facturas del mes vencen el día 10.</p>`;
+    cierre = `<p>Adjuntamos los datos bancarios para realizar el pago. Una vez hecho, les pedimos que nos envíen el comprobante respondiendo este mail.</p><p>Si ya realizaron el pago, por favor desestimen este mensaje.</p>`;
+  } else if (tipoMail === 'reclamo1') {
+    intro = `<p>Al día de hoy registramos las siguientes facturas vencidas e impagas.</p>`;
+    cierre = `<p>Les pedimos regularizar el pago a la brevedad y enviarnos el comprobante respondiendo este mail. Adjuntamos los datos bancarios.</p><p>Si ya realizaron el pago, por favor envíennos el comprobante para registrarlo.</p>`;
+  } else if (tipoMail === 'reclamo2') {
+    intro = `<p>Este es el segundo aviso por las siguientes facturas vencidas, que a la fecha siguen sin registrar pago.</p>`;
+    cierre = `<p>Necesitamos que regularicen la deuda dentro de las próximas 48 horas y nos envíen el comprobante respondiendo este mail. Adjuntamos los datos bancarios.</p><p>Si existe algún inconveniente con el pago, respondan este mail para coordinarlo.</p>`;
+  } else {
+    intro = `<p>La cuenta de ${esc(empresa)} registra facturas con más de ${DIAS_MORA} días de atraso y se encuentra en revisión.</p>
+      <p>Sobre el capital adeudado se aplican intereses por actualización (IPC INDEC, acumulado desde el mes siguiente a cada vencimiento).</p>`;
+    cierre = `<p><b>Si cancelan el capital dentro de los próximos 10 días, no se aplicarán los intereses:</b><br>${totales(m => fmt(c.totales[m], m))}</p>
+      <p><b>Pasado ese plazo, el total con intereses es:</b><br>${totales(m => fmt(r2(c.totales[m] + (c.intereses[m] || 0)), m))}</p>
+      <p>Adjuntamos los datos bancarios. Les pedimos que nos envíen el comprobante respondiendo este mail.</p>`;
+  }
+  const totalLinea = mora ? '' : `<p><b>Total pendiente:</b><br>${totales(m => fmt(c.totales[m], m))}</p>`;
+
+  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#222;max-width:640px;line-height:1.5">
+    <p>Hola ${esc(empresa)},</p>${intro}${tabla}${totalLinea}${cierre}
+    <p>Saludos,<br>Administración<br>Huerta Coworking</p></div>`;
+}
+
+// ---------- Rutas ----------
+module.exports = function montarReclamos(app, pool) {
+  const admin = (req, res, next) => {
+    const k = req.get('x-admin-key') || '';
+    const ok = ADMIN_KEY && k.length === ADMIN_KEY.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_KEY));
+    if (!ok) return res.status(401).json({ error: 'Clave de acceso incorrecta' });
+    next();
+  };
+
+  pool.query(`
+    CREATE TABLE IF NOT EXISTS reclamos_lotes (id TEXT PRIMARY KEY, tipo TEXT, data JSONB, created_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS reclamos_envios (
+      id SERIAL PRIMARY KEY, lote_id TEXT, id_cliente TEXT, empresa TEXT, email TEXT, tipo_mail TEXT,
+      facturas JSONB, estado TEXT, message_id TEXT, detalle TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE UNIQUE INDEX IF NOT EXISTS reclamos_envios_lote_cliente ON reclamos_envios(lote_id, id_cliente);
+    CREATE INDEX IF NOT EXISTS reclamos_envios_cliente_fecha ON reclamos_envios(id_cliente, created_at);
+    CREATE TABLE IF NOT EXISTS reclamos_contactos (id_cliente TEXT PRIMARY KEY, email TEXT, updated_at TIMESTAMPTZ DEFAULT NOW());
+  `).then(() => console.log('Reclamos: tablas listas')).catch(e => console.error('Reclamos: error creando tablas', e.message));
+
+  async function leerIPC() {
+    const r = await pool.query(`SELECT value FROM config WHERE key='ipc'`);
+    try { return r.rows[0] ? JSON.parse(r.rows[0].value) : {}; } catch { return {}; }
+  }
+
+  // Estado general
+  app.get('/api/reclamos/estado', admin, async (req, res) => {
+    try {
+      const cuenta = await gmailCuenta(pool);
+      const ipc = await leerIPC();
+      const meses = Object.keys(ipc).sort();
+      res.json({
+        gmail: { conectado: !!cuenta?.refresh_token, email: cuenta?.email || null },
+        colppy: { configurado: !!process.env.COLPPY_PASS },
+        ipc: { meses: meses.length, ultimo: meses[meses.length - 1] || null },
+      });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Gmail: conectar una sola vez
+  app.get('/api/gmail/conectar-url', admin, (req, res) => {
+    if (!process.env.GMAIL_CLIENT_ID || !process.env.GMAIL_CLIENT_SECRET) {
+      return res.status(500).json({ error: 'Faltan GMAIL_CLIENT_ID o GMAIL_CLIENT_SECRET en Render' });
+    }
+    const state = crypto.randomBytes(16).toString('hex');
+    oauthStates.set(state, Date.now());
+    const url = oauthClient().generateAuthUrl({
+      access_type: 'offline', prompt: 'consent', state,
+      scope: ['https://www.googleapis.com/auth/gmail.send', 'openid', 'email'],
+    });
+    res.json({ url });
+  });
+
+  app.get('/api/gmail/oauth2callback', async (req, res) => {
+    const pagina = (titulo, texto) => res.send(`<!doctype html><meta charset="utf-8"><title>${titulo}</title>
+      <body style="font-family:system-ui;padding:40px;max-width:520px"><h2>${titulo}</h2><p>${texto}</p></body>`);
+    try {
+      const { code, state, error } = req.query;
+      if (error) return pagina('No se conectó Gmail', esc(error));
+      const ts = oauthStates.get(state);
+      oauthStates.delete(state);
+      if (!ts || Date.now() - ts > 15 * 60e3) return pagina('Link vencido', 'Volvé al sistema y tocá Conectar Gmail de nuevo.');
+      const c = oauthClient();
+      const { tokens } = await c.getToken(code);
+      if (!tokens.refresh_token) return pagina('Falta autorización', 'Google no devolvió el permiso permanente. Quitá el acceso de la app en tu cuenta de Google y conectá de nuevo.');
+      let email = null;
+      if (tokens.id_token) {
+        const t = await c.verifyIdToken({ idToken: tokens.id_token, audience: process.env.GMAIL_CLIENT_ID });
+        email = t.getPayload()?.email || null;
+      }
+      await pool.query(`INSERT INTO config (key, value) VALUES ('gmail_refresh', $1) ON CONFLICT (key) DO UPDATE SET value=$1`,
+        [JSON.stringify({ refresh_token: tokens.refresh_token, email, ts: new Date().toISOString() })]);
+      pagina('Gmail conectado', `Los mails se van a enviar desde <b>${esc(email || 'la cuenta autorizada')}</b>. Ya podés cerrar esta pestaña.`);
+    } catch (e) { pagina('Error', esc(e.message)); }
+  });
+
+  // IPC: {"2026-01": 2.2, ...} en % mensual
+  app.post('/api/reclamos/ipc', admin, async (req, res) => {
+    try {
+      const ipc = req.body?.ipc || {};
+      const limpio = {};
+      for (const [k, v] of Object.entries(ipc)) if (/^\d{4}-\d{2}$/.test(k) && isFinite(+v)) limpio[k] = +v;
+      if (!Object.keys(limpio).length) return res.status(400).json({ error: 'Formato: {"ipc": {"2026-01": 2.2}}' });
+      const actual = await leerIPC();
+      await pool.query(`INSERT INTO config (key, value) VALUES ('ipc', $1) ON CONFLICT (key) DO UPDATE SET value=$1`,
+        [JSON.stringify({ ...actual, ...limpio })]);
+      res.json({ ok: true, meses: Object.keys({ ...actual, ...limpio }).length });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Preparar lote: trae todo de Colppy y arma los mails (no envía nada)
+  app.post('/api/reclamos/preparar', admin, async (req, res) => {
+    try {
+      const tipo = req.body?.tipo;
+      if (!['recordatorio', 'reclamo1', 'reclamo2'].includes(tipo)) return res.status(400).json({ error: 'Tipo de mail inválido' });
+      const hoy = hoyAR();
+      const ipc = await leerIPC();
+      const crudas = await colppyFacturasPendientes();
+
+      // Normalizar facturas
+      const porCliente = new Map();
+      for (const f of crudas) {
+        const total = +f.totalFactura || 0;
+        const saldo = r2(total - (+f.totalaplicado || 0));
+        if (saldo <= 1) continue;
+        const esAB = f.idTipoFactura === '0' || f.idTipoFactura === '1';
+        const usd = esAB ? null : parseUSD(f.descripcion);
+        const moneda = usd ? 'USD' : 'ARS';
+        const importe = usd ? r2(usd * (total ? saldo / total : 1)) : saldo;
+        const venc = String(f.fechaPago || f.fechaFactura).slice(0, 10);
+        const diasVencida = Math.floor((Date.parse(hoy) - Date.parse(venc)) / 86400000);
+        const pv = String(f.nroFactura || '').split('-')[0];
+        const fac = {
+          idFactura: f.idFactura, nro: f.nroFactura, letra: f.idTipoFactura === '0' ? 'A' : f.idTipoFactura === '1' ? 'B' : '',
+          descripcion: f.descripcion, venc, diasVencida, moneda, importe, tieneCAE: !!f.cae, pv,
+        };
+        if (!porCliente.has(f.idCliente)) porCliente.set(f.idCliente, { idCliente: f.idCliente, empresa: (f.RazonSocial || f.NombreFantasia || '').trim(), facturas: [] });
+        porCliente.get(f.idCliente).facturas.push(fac);
+      }
+
+      // Emails guardados
+      const [ovr, facEm, cliEm] = await Promise.all([
+        pool.query(`SELECT id_cliente, email FROM reclamos_contactos`),
+        pool.query(`SELECT DISTINCT ON (lower(trim(empresa))) lower(trim(empresa)) k, email FROM facturas WHERE email <> '' ORDER BY lower(trim(empresa)), created_at DESC`),
+        pool.query(`SELECT lower(trim(empresa)) k, email FROM clientes WHERE email <> ''`),
+      ]);
+      const mOvr = new Map(ovr.rows.map(r => [r.id_cliente, r.email]));
+      const mFac = new Map(facEm.rows.map(r => [claveEmpresa(r.k), r.email]));
+      const mCli = new Map(cliEm.rows.map(r => [claveEmpresa(r.k), r.email]));
+
+      const recientes = await pool.query(
+        `SELECT DISTINCT id_cliente FROM reclamos_envios WHERE estado='enviado' AND created_at > NOW() - ($1 || ' hours')::interval`,
+        [String(HORAS_BLOQUEO_REENVIO)]);
+      const yaEnviados = new Set(recientes.rows.map(r => r.id_cliente));
+
+      const mails = [];
+      const faltanEmail = [];
+      for (const c of porCliente.values()) {
+        const maxDias = Math.max(...c.facturas.map(f => f.diasVencida));
+        const tipoMail = maxDias > DIAS_MORA ? 'mora' : tipo;
+        let facturas = c.facturas;
+        if (tipoMail === 'reclamo1' || tipoMail === 'reclamo2') facturas = facturas.filter(f => f.diasVencida > 0);
+        if (!facturas.length) continue;
+        facturas.sort((a, b) => a.venc.localeCompare(b.venc));
+
+        const totales = { ARS: 0, USD: 0 }, intereses = { ARS: 0, USD: 0 };
+        let ipcIncompleto = false;
+        for (const f of facturas) {
+          totales[f.moneda] = r2(totales[f.moneda] + f.importe);
+          if (tipoMail === 'mora') {
+            const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
+            Object.assign(f, { meses: i.meses, interes: i.interes });
+            intereses[f.moneda] = r2(intereses[f.moneda] + i.interes);
+            if (i.usaFallback) ipcIncompleto = true;
+          }
+        }
+
+        const k = claveEmpresa(c.empresa);
+        const tieneUSD = totales.USD > 0;
+        let email = [], origen = '';
+        const candidatos = [
+          ['editado', mOvr.get(c.idCliente)],
+          ...(tieneUSD ? [['contacto USD', mFac.get(k)], ['clientes', mCli.get(k)]] : [['clientes', mCli.get(k)], ['facturas', mFac.get(k)]]),
+        ];
+        for (const [o, v] of candidatos) { const e = limpiarEmails(v); if (e.length) { email = e; origen = o; break; } }
+
+        const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
+        const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
+        const problemas = [];
+        if (facturas.some(f => !f.tieneCAE)) problemas.push('Hay facturas sin CAE: puede que no se adjunte su PDF');
+        if (ipcIncompleto) problemas.push(`Faltan meses de IPC: se usa ${TASA_FALLBACK}% mensual`);
+        if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
+
+        const mail = {
+          idCliente: c.idCliente, empresa: c.empresa, email, emailOrigen: origen, cc,
+          sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
+          facturas, totales, intereses, problemas, bloqueado: yaEnviados.has(c.idCliente),
+        };
+        if (!email.length) faltanEmail.push(mail);
+        mails.push(mail);
+      }
+
+      // Último recurso: email de Colppy para los que no tienen (de a 5 en paralelo)
+      for (let i = 0; i < faltanEmail.length; i += 5) {
+        await Promise.all(faltanEmail.slice(i, i + 5).map(async m => {
+          const e = await colppyEmailCliente(m.idCliente);
+          if (e.length) { m.email = e; m.emailOrigen = 'Colppy'; }
+          else m.problemas.unshift('Sin email: cargalo para poder enviar');
+        }));
+      }
+
+      mails.sort((a, b) => (b.tipoMail === 'mora') - (a.tipoMail === 'mora') || a.empresa.localeCompare(b.empresa));
+      if (mails.length > MAX_MAILS_POR_LOTE) return res.status(400).json({ error: `El lote tiene ${mails.length} mails, más que el máximo permitido (${MAX_MAILS_POR_LOTE}). Revisá Colppy.` });
+
+      const loteId = crypto.randomBytes(8).toString('hex');
+      await pool.query(`DELETE FROM reclamos_lotes WHERE created_at < NOW() - interval '7 days'`);
+      await pool.query(`INSERT INTO reclamos_lotes (id, tipo, data) VALUES ($1,$2,$3)`, [loteId, tipo, JSON.stringify(mails)]);
+
+      const resumen = {
+        mails: mails.length,
+        enviables: mails.filter(m => m.email.length && !m.bloqueado).length,
+        mora: mails.filter(m => m.tipoMail === 'mora').length,
+        sinEmail: mails.filter(m => !m.email.length).length,
+        totalARS: r2(mails.reduce((s, m) => s + m.totales.ARS, 0)),
+        totalUSD: r2(mails.reduce((s, m) => s + m.totales.USD, 0)),
+        facturas: mails.reduce((s, m) => s + m.facturas.length, 0),
+      };
+      res.json({ ok: true, loteId, tipo, resumen, mails });
+    } catch (e) {
+      console.error('preparar:', e);
+      res.status(500).json({ error: e.message });
+    }
+  });
+
+  async function leerLote(loteId) {
+    const r = await pool.query(`SELECT data, created_at FROM reclamos_lotes WHERE id=$1`, [loteId]);
+    if (!r.rows[0]) throw new Error('Lote no encontrado. Volvé a buscar facturas.');
+    if (Date.now() - new Date(r.rows[0].created_at).getTime() > LOTE_VALIDO_HORAS * 3600e3) throw new Error('Lote vencido. Volvé a buscar facturas.');
+    return r.rows[0].data;
+  }
+
+  // Vista previa del mail de un cliente
+  app.get('/api/reclamos/preview', admin, async (req, res) => {
+    try {
+      const mails = await leerLote(req.query.loteId);
+      const m = mails.find(x => x.idCliente === req.query.idCliente);
+      if (!m) return res.status(404).json({ error: 'Cliente no está en el lote' });
+      res.json({ asunto: m.asunto, to: m.email, cc: m.cc, html: armarHtml(m) });
+    } catch (e) { res.status(400).json({ error: e.message }); }
+  });
+
+  // Enviar UN cliente del lote (el frontend los llama de a uno, en orden)
+  app.post('/api/reclamos/enviar', admin, async (req, res) => {
+    const { loteId, idCliente, email: emailEditado } = req.body || {};
+    let registrado = false;
+    try {
+      const mails = await leerLote(loteId);
+      const m = mails.find(x => x.idCliente === idCliente);
+      if (!m) return res.status(404).json({ error: 'Cliente no está en el lote' });
+
+      let to = m.email;
+      if (emailEditado != null) {
+        const e = limpiarEmails(emailEditado);
+        if (!e.length) return res.status(400).json({ error: `Email inválido para ${m.empresa}` });
+        if (e.join(',') !== m.email.join(',')) {
+          to = e;
+          await pool.query(`INSERT INTO reclamos_contactos (id_cliente, email, updated_at) VALUES ($1,$2,NOW())
+            ON CONFLICT (id_cliente) DO UPDATE SET email=$2, updated_at=NOW()`, [idCliente, e.join(', ')]);
+        }
+      }
+      if (!to.length) return res.status(400).json({ error: `${m.empresa} no tiene email` });
+
+      // Bloqueo de reenvío: mismo cliente en las últimas horas
+      const rec = await pool.query(
+        `SELECT 1 FROM reclamos_envios WHERE id_cliente=$1 AND estado='enviado' AND created_at > NOW() - ($2 || ' hours')::interval LIMIT 1`,
+        [idCliente, String(HORAS_BLOQUEO_REENVIO)]);
+      if (rec.rowCount) return res.json({ ok: true, omitido: true, motivo: 'Ya se le envió un mail recientemente' });
+
+      // Reserva: un solo intento por cliente y lote (evita doble click o reintentos)
+      const ins = await pool.query(
+        `INSERT INTO reclamos_envios (lote_id, id_cliente, empresa, email, tipo_mail, facturas, estado)
+         VALUES ($1,$2,$3,$4,$5,$6,'enviando') ON CONFLICT (lote_id, id_cliente) DO NOTHING`,
+        [loteId, idCliente, m.empresa, to.join(', '), m.tipoMail, JSON.stringify(m.facturas.map(f => f.nro))]);
+      if (!ins.rowCount) return res.json({ ok: true, omitido: true, motivo: 'Ya se procesó en este lote' });
+      registrado = true;
+
+      const { token, email: fromEmail } = await gmailAccessToken(pool);
+
+      // Adjuntos: PDF de cada factura desde Colppy + datos bancarios
+      const adjuntos = [];
+      const sinPdf = [];
+      for (const f of m.facturas) {
+        const buf = await colppyPdfFactura(f.idFactura, idCliente);
+        if (buf) adjuntos.push({ filename: `Factura ${f.letra ? f.letra + ' ' : ''}${f.nro}.pdf`, buf });
+        else sinPdf.push(f.nro);
+      }
+      const bancos = await pool.query(`SELECT tipo, nombre, url FROM pdfs_banco`);
+      const banco = Object.fromEntries(bancos.rows.map(r => [r.tipo, r]));
+      for (const [mon, key] of [['ARS', 'cbu'], ['USD', 'merc']]) {
+        if (m.totales[mon] > 0 && banco[key]?.url) {
+          const r = await fetch(banco[key].url);
+          if (r.ok) adjuntos.push({ filename: banco[key].nombre || `Datos bancarios ${mon}.pdf`, buf: Buffer.from(await r.arrayBuffer()) });
+        }
+      }
+
+      const raw = armarMime({ fromEmail: fromEmail || process.env.GMAIL_FROM, to, toName: m.empresa, cc: m.cc, subject: m.asunto, html: armarHtml(m), adjuntos });
+      if (raw.length > 24 * 1024 * 1024) throw new Error(`El mail de ${m.empresa} supera 24 MB`);
+      const messageId = await gmailEnviar(token, raw);
+
+      await pool.query(`UPDATE reclamos_envios SET estado='enviado', message_id=$3, detalle=$4 WHERE lote_id=$1 AND id_cliente=$2`,
+        [loteId, idCliente, messageId, sinPdf.length ? 'Sin PDF: ' + sinPdf.join(', ') : null]);
+      // Mantiene la tabla vieja al día para el sistema actual
+      await pool.query(`UPDATE facturas SET sent=TRUE WHERE referencia = ANY($1)`, [m.facturas.map(f => f.nro)]).catch(() => {});
+
+      res.json({ ok: true, messageId, sinPdf });
+    } catch (e) {
+      console.error('enviar:', idCliente, e.message);
+      if (registrado) await pool.query(`UPDATE reclamos_envios SET estado='error', detalle=$3 WHERE lote_id=$1 AND id_cliente=$2`, [loteId, idCliente, e.message]).catch(() => {});
+      res.status(e.code === 'GMAIL' ? 401 : 500).json({ error: e.message, gmail: e.code === 'GMAIL' });
+    }
+  });
+
+  app.get('/api/reclamos/historial', admin, async (req, res) => {
+    try {
+      const r = await pool.query(`SELECT empresa, email, tipo_mail, estado, detalle, created_at FROM reclamos_envios ORDER BY created_at DESC LIMIT 200`);
+      res.json(r.rows);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+};
+
+module.exports._test = { parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };

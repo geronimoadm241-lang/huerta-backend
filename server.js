@@ -208,20 +208,35 @@ app.get('/api/pdfs/banco', async (req, res) => {
 // PDFs FACTURAS
 app.post('/api/pdfs/factura', upload.single('file'), async (req, res) => {
   try {
+    if (!req.file) return res.status(400).json({ error: 'No se recibió archivo' });
     const fileBuffer = req.file.buffer;
     const fileName = req.file.originalname;
-    const publicId = fileName.replace('.pdf', '');
+
+    // Extrae el número de comprobante (ej: "Factura T 0027-00000012.pdf" -> "0027-00000012")
+    const refMatch = fileName.match(/(\d{4,5})-(\d{8})/);
+    if (!refMatch) {
+      return res.status(400).json({ error: `El nombre "${fileName}" no tiene un número de comprobante (formato 0000-00000000)` });
+    }
+    const referencia = `${refMatch[1]}-${refMatch[2]}`;
+
+    // Letra del tipo si viene en el nombre (ej: "Factura T 0027-...")
+    const tipoMatch = fileName.match(/\b([ABIMTX])\s*[-_ ]?\s*\d{4,5}-\d{8}/i);
+    const tipo = tipoMatch ? tipoMatch[1].toUpperCase() : null;
+
+    const publicId = `${tipo ? tipo + '-' : ''}${referencia}.pdf`;
     const result = await new Promise((resolve, reject) => {
       cloudinary.uploader.upload_stream(
         { resource_type: 'raw', folder: 'huerta-facturas', public_id: publicId, overwrite: true },
-        (err, res) => err ? reject(err) : resolve(res)
+        (err, r) => err ? reject(err) : resolve(r)
       ).end(fileBuffer);
     });
-    await pool.query(
-      `UPDATE facturas SET pdf_url=$1 WHERE referencia=$2 OR pdf=$3 OR pdf=$4`,
-      [result.secure_url, publicId, fileName, publicId]
+
+    const upd = await pool.query(
+      `UPDATE facturas SET pdf_url=$1 WHERE referencia=$2 AND ($3::text IS NULL OR tipo=$3)`,
+      [result.secure_url, referencia, tipo]
     );
-    res.json({ ok: true, url: result.secure_url, nombre: fileName });
+    console.log('PDF factura:', fileName, '->', referencia, tipo || '', 'matcheadas:', upd.rowCount);
+    res.json({ ok: true, url: result.secure_url, nombre: fileName, referencia, matched: upd.rowCount });
   } catch (e) { res.status(500).json({ error: e.message }) }
 });
 
@@ -283,10 +298,9 @@ app.post('/api/email/send', async (req, res) => {
       } else {
         console.log('Downloading attachment:', att.filename, src.substring(0, 80));
         try {
-          const fetch = require('node-fetch');
           const r = await fetch(src);
           if (!r.ok) throw new Error('Download failed: ' + r.status);
-          const buf = await r.buffer();
+          const buf = Buffer.from(await r.arrayBuffer());
           b64data = buf.toString('base64');
           contentType = r.headers.get('content-type') || 'application/pdf';
           console.log('Downloaded:', att.filename, 'size:', b64data.length);
@@ -323,7 +337,6 @@ app.post('/api/email/send', async (req, res) => {
     if(sizeKB > 25000) return res.status(400).json({ error: `Email demasiado grande (${sizeKB}KB).` });
 
     const encoded = Buffer.from(rawEmail).toString('base64').replace(/\+/g, '-').replace(/\//g, '_').replace(/=/g, '');
-    const fetch = require('node-fetch');
     const ctrl = new AbortController();
     const sendTimeout = setTimeout(() => ctrl.abort(), 55000);
     const gmailRes = await fetch('https://gmail.googleapis.com/gmail/v1/users/me/messages/send', {
@@ -345,6 +358,9 @@ app.post('/api/email/send', async (req, res) => {
     res.status(500).json({ error: e.message });
   }
 });
+
+// RECLAMOS AUTOMÁTICOS (Colppy + Gmail sin renovar token)
+require('./reclamos')(app, pool);
 
 const PORT = process.env.PORT || 3000;
 initDB().then(() => {
