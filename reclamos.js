@@ -1008,6 +1008,53 @@ module.exports = function montarReclamos(app, pool) {
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
+  // Datos bancarios: ver y reemplazar los PDF (con clave)
+  const multer = require('multer');
+  const cloudinary = require('cloudinary').v2;
+  cloudinary.config({
+    cloud_name: process.env.CLOUDINARY_CLOUD_NAME,
+    api_key: process.env.CLOUDINARY_API_KEY,
+    api_secret: process.env.CLOUDINARY_API_SECRET,
+  });
+  const subida = multer({ storage: multer.memoryStorage(), limits: { fileSize: 10 * 1024 * 1024 } });
+
+  app.get('/api/reclamos/bancos', admin, async (req, res) => {
+    try {
+      const r = await pool.query(`SELECT tipo, nombre, url FROM pdfs_banco`);
+      const m = Object.fromEntries(r.rows.map(x => [x.tipo, x]));
+      res.json(Object.entries(BANCOS).map(([tipo, b]) => ({ tipo, nombre: b.nombre, moneda: b.moneda, cargado: !!m[tipo]?.url, archivoOriginal: m[tipo]?.nombre || null })));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.get('/api/reclamos/bancos/:tipo/pdf', admin, async (req, res) => {
+    try {
+      const r = await pool.query(`SELECT url FROM pdfs_banco WHERE tipo=$1`, [req.params.tipo]);
+      if (!r.rows[0]?.url) return res.status(404).json({ error: 'No está cargado' });
+      const f = await fetch(r.rows[0].url);
+      if (!f.ok) return res.status(502).json({ error: 'No se pudo descargar de Cloudinary' });
+      res.set('Content-Type', 'application/pdf');
+      res.send(Buffer.from(await f.arrayBuffer()));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post('/api/reclamos/bancos/:tipo', admin, subida.single('file'), async (req, res) => {
+    try {
+      const tipo = req.params.tipo;
+      if (!BANCOS[tipo]) return res.status(400).json({ error: 'Banco inválido' });
+      if (!req.file) return res.status(400).json({ error: 'No se recibió el archivo' });
+      if (req.file.buffer.subarray(0, 1024).indexOf('%PDF') < 0) return res.status(400).json({ error: 'El archivo no es un PDF' });
+      const result = await new Promise((resolve, reject) => {
+        cloudinary.uploader.upload_stream(
+          { resource_type: 'raw', folder: 'huerta-banco', public_id: `banco-${tipo}`, overwrite: true, invalidate: true },
+          (err, r) => err ? reject(err) : resolve(r)
+        ).end(req.file.buffer);
+      });
+      await pool.query(`INSERT INTO pdfs_banco (tipo, nombre, url, public_id) VALUES ($1,$2,$3,$4)
+        ON CONFLICT (tipo) DO UPDATE SET nombre=$2, url=$3, public_id=$4`, [tipo, req.file.originalname, result.secure_url, result.public_id]);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Cargar a mano el monto USD de una factura
   app.post('/api/reclamos/usd', admin, async (req, res) => {
     try {
