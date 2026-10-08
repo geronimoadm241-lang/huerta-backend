@@ -649,6 +649,18 @@ module.exports = function montarReclamos(app, pool) {
     }
   });
 
+  // PDF de una factura (se descarga de Colppy en el momento)
+  app.get('/api/reclamos/pdf', admin, async (req, res) => {
+    try {
+      const { idFactura, idCliente } = req.query;
+      if (!/^\d+$/.test(idFactura || '') || !/^\d+$/.test(idCliente || '')) return res.status(400).json({ error: 'Factura inválida' });
+      const buf = await colppyPdfFactura(idFactura, idCliente);
+      if (!buf) return res.status(404).json({ error: 'Colppy no generó el PDF de esta factura (puede no tener CAE)' });
+      res.set('Content-Type', 'application/pdf');
+      res.send(buf);
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   app.get('/api/reclamos/historial', admin, async (req, res) => {
     try {
       const r = await pool.query(`SELECT empresa, email, tipo_mail, estado, detalle, created_at FROM reclamos_envios ORDER BY created_at DESC LIMIT 200`);
