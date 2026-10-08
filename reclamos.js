@@ -34,7 +34,7 @@ const MAX_MAILS_POR_LOTE = 200;
 const LOTE_VALIDO_HORAS = 6;
 
 const TIPOS = {
-  recordatorio: { label: 'Recordatorio día 8', asunto: () => 'Factura próxima a vencer · Huerta Coworking' },
+  recordatorio: { label: 'Recordatorio día 8', asunto: () => 'Recordatorio de vencimiento · Huerta Coworking' },
   reclamo1: { label: 'Reclamo día 15', asunto: () => 'Factura pendiente de pago · Huerta Coworking' },
   reclamo2: { label: 'Segundo aviso día 20', asunto: () => 'Segundo aviso · Factura pendiente · Huerta Coworking' },
   mora: { label: 'Mora +90 días', asunto: emp => `URGENTE: Deuda en mora · ${emp} · Cuenta en revisión` },
@@ -471,7 +471,8 @@ function armarHtml(c, adjuntos) {
   const monedas = ['ARS', 'USD'].filter(m => c.totales[m] > 0);
   const F = 'font-family:Arial,Helvetica,sans-serif;';
   const MONO = "font-family:'SFMono-Regular',Menlo,Consolas,monospace;";
-  const ROJO = '#C0392B', GRIS = '#8A8A8A', BEIGE = '#F5F2EC', LINEA = '#E8E3DA';
+  const suave = tipoMail === 'recordatorio';
+  const ROJO = suave ? '#222222' : '#C0392B', GRIS = '#8A8A8A', BEIGE = '#F5F2EC', LINEA = '#E8E3DA';
 
   const badge = d => {
     if (d <= 0) return `<span style="background:#E3F1E4;color:#2E7D32;font-size:11px;font-weight:bold;padding:2px 7px;border-radius:4px">${d === 0 ? 'hoy' : 'vigente'}</span>`;
@@ -499,8 +500,8 @@ function armarHtml(c, adjuntos) {
   const p = s => `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;color:#333">${s}</p>`;
   let cuerpo;
   if (tipoMail === 'recordatorio') {
-    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te recordamos que ${unaVarias('tenés una factura pendiente', `tenés ${n} facturas pendientes`)} en tu cuenta. Las facturas del mes vencen el día 10.`)
-      + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te escribimos solo para recordarte que ${unaVarias('la factura de este mes vence', 'las facturas de este mes vencen')} el día 10. Abajo te dejamos el detalle y los datos para el pago.`)
+      + p('Si ya lo abonaste, muchas gracias y podés ignorar este mensaje. Cualquier consulta, respondé este email.');
   } else if (tipoMail === 'reclamo1') {
     cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te contactamos porque registramos ${unaVarias('una factura impaga', `${n} facturas impagas`)} en tu cuenta. Te pedimos que regularices la situación a la brevedad.`)
       + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
@@ -543,7 +544,7 @@ function armarHtml(c, adjuntos) {
   <tr><td style="background:${BEIGE};padding:18px 26px;border-bottom:1px solid ${LINEA}">
     <table cellpadding="0" cellspacing="0"><tr>
       <td style="padding-right:40px;border-right:1px solid #D6D0C4;vertical-align:top">
-        <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:6px">${mora ? 'CAPITAL ADEUDADO' : 'TOTAL PENDIENTE'}</div>${totalHeader}</td>
+        <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:6px">${mora ? 'CAPITAL ADEUDADO' : suave ? 'TOTAL' : 'TOTAL PENDIENTE'}</div>${totalHeader}</td>
       <td style="padding-left:40px;vertical-align:top;text-align:center">
         <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:6px">FACTURAS</div>
         <div style="font-size:24px;font-weight:bold;color:#333">${n}</div></td>
@@ -727,6 +728,7 @@ module.exports = function montarReclamos(app, pool) {
         const tipoMail = maxDias > DIAS_MORA ? 'mora' : tipo;
         let facturas = c.facturas;
         if (tipoMail === 'reclamo1' || tipoMail === 'reclamo2') facturas = facturas.filter(f => f.diasVencida > 0);
+        if (tipoMail === 'recordatorio') facturas = facturas.filter(f => f.diasVencida <= 0);
         if (!facturas.length) continue;
         facturas.sort((a, b) => a.venc.localeCompare(b.venc));
 
