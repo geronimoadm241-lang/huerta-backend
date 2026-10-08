@@ -599,6 +599,8 @@ module.exports = function montarReclamos(app, pool) {
     CREATE UNIQUE INDEX IF NOT EXISTS reclamos_envios_lote_cliente ON reclamos_envios(lote_id, id_cliente);
     CREATE INDEX IF NOT EXISTS reclamos_envios_cliente_fecha ON reclamos_envios(id_cliente, created_at);
     CREATE TABLE IF NOT EXISTS reclamos_contactos (id_cliente TEXT PRIMARY KEY, email TEXT, updated_at TIMESTAMPTZ DEFAULT NOW());
+    ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS contacto TEXT;
+    ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS excluido BOOLEAN DEFAULT FALSE;
     CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
       interes NUMERIC, factura_interes TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE INDEX IF NOT EXISTS reclamos_intereses_factura ON reclamos_intereses(id_factura);
@@ -770,11 +772,12 @@ module.exports = function montarReclamos(app, pool) {
 
       // Emails guardados
       const [ovr, facEm, cliEm] = await Promise.all([
-        pool.query(`SELECT id_cliente, email FROM reclamos_contactos`),
+        pool.query(`SELECT id_cliente, email, contacto, excluido FROM reclamos_contactos`),
         pool.query(`SELECT DISTINCT ON (lower(trim(empresa))) lower(trim(empresa)) k, email FROM facturas WHERE email <> '' ORDER BY lower(trim(empresa)), created_at DESC`),
         pool.query(`SELECT lower(trim(empresa)) k, email, contacto FROM clientes`),
       ]);
       const mOvr = new Map(ovr.rows.map(r => [r.id_cliente, r.email]));
+      const mOvrFull = new Map(ovr.rows.map(r => [r.id_cliente, r]));
       const mFac = new Map(facEm.rows.map(r => [claveEmpresa(r.k), r.email]));
       const mCli = new Map(cliEm.rows.map(r => [claveEmpresa(r.k), r.email]));
       const mContacto = new Map(cliEm.rows.map(r => [claveEmpresa(r.k), r.contacto]));
@@ -810,7 +813,8 @@ module.exports = function montarReclamos(app, pool) {
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
-          idCliente: c.idCliente, moneda: c.moneda, empresa: c.empresa, contacto: mContacto.get(k) || '', email, emailOrigen: origen, cc,
+          idCliente: c.idCliente, moneda: c.moneda, empresa: c.empresa, contacto: mOvrFull.get(c.idCliente)?.contacto || mContacto.get(k) || '',
+          excluido: !!mOvrFull.get(c.idCliente)?.excluido, email, emailOrigen: origen, cc,
           sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
           facturas, problemas, bloqueado: yaEnviados.has(c.idCliente),
         };
@@ -837,7 +841,7 @@ module.exports = function montarReclamos(app, pool) {
 
       const resumen = {
         mails: mails.length,
-        enviables: mails.filter(m => m.email.length && !m.bloqueado && !m.faltaUSD).length,
+        enviables: mails.filter(m => m.email.length && !m.bloqueado && !m.faltaUSD && !m.excluido).length,
         faltaUSD: mails.filter(m => m.faltaUSD).length,
         mora: mails.filter(m => m.tipoMail === 'mora').length,
         sinEmail: mails.filter(m => !m.email.length).length,
@@ -888,6 +892,7 @@ module.exports = function montarReclamos(app, pool) {
             ON CONFLICT (id_cliente) DO UPDATE SET email=$2, updated_at=NOW()`, [idCliente, e.join(', ')]);
         }
       }
+      if (m.excluido) return res.status(400).json({ error: `${m.empresa} está excluido de los reclamos` });
       if (!to.length) return res.status(400).json({ error: `${m.empresa} no tiene email` });
       if (m.facturas.some(f => f.faltaUSD)) return res.status(400).json({ error: `${m.empresa}: falta cargar el monto USD de ${m.facturas.filter(f => f.faltaUSD).map(f => f.nro).join(', ')}` });
 
@@ -939,6 +944,34 @@ module.exports = function montarReclamos(app, pool) {
       if (registrado) await pool.query(`UPDATE reclamos_envios SET estado='error', detalle=$3 WHERE lote_id=$1 AND id_cliente=$2`, [loteId, idCliente, e.message]).catch(() => {});
       res.status(e.code === 'GMAIL' ? 401 : 500).json({ error: e.message, gmail: e.code === 'GMAIL' });
     }
+  });
+
+  // Editar datos del cliente para reclamos (email, nombre del saludo, excluir)
+  app.post('/api/reclamos/cliente', admin, async (req, res) => {
+    try {
+      const { loteId, idCliente } = req.body || {};
+      const r = await pool.query(`SELECT data FROM reclamos_lotes WHERE id=$1`, [loteId]);
+      if (!r.rows[0]) return res.status(404).json({ error: 'Lote no encontrado. Volvé a buscar facturas.' });
+      const mails = r.rows[0].data;
+      const m = mails.find(x => x.idCliente === idCliente);
+      if (!m) return res.status(404).json({ error: 'Cliente no está en el lote' });
+      const cambios = {};
+      if (req.body.email != null) {
+        const e = limpiarEmails(req.body.email);
+        if (String(req.body.email).trim() && !e.length) return res.status(400).json({ error: 'Email inválido' });
+        cambios.email = e.join(', '); m.email = e; m.emailOrigen = e.length ? 'editado' : '';
+      }
+      if (req.body.contacto != null) { cambios.contacto = String(req.body.contacto).trim().slice(0, 80); m.contacto = cambios.contacto; }
+      if (req.body.excluido != null) { cambios.excluido = !!req.body.excluido; m.excluido = cambios.excluido; }
+      const cols = Object.keys(cambios);
+      if (!cols.length) return res.json({ ok: true, mail: m });
+      await pool.query(
+        `INSERT INTO reclamos_contactos (id_cliente, ${cols.join(', ')}, updated_at) VALUES ($1, ${cols.map((_, i) => '$' + (i + 2)).join(', ')}, NOW())
+         ON CONFLICT (id_cliente) DO UPDATE SET ${cols.map((c, i) => `${c}=$${i + 2}`).join(', ')}, updated_at=NOW()`,
+        [idCliente, ...cols.map(c => cambios[c])]);
+      await pool.query(`UPDATE reclamos_lotes SET data=$2 WHERE id=$1`, [loteId, JSON.stringify(mails)]);
+      res.json({ ok: true, mail: m });
+    } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
   // Cargar a mano el monto USD de una factura
