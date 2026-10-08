@@ -227,48 +227,124 @@ function calcularIntereses(importe, venc, ipc, hoy) {
 }
 
 // ---------- Armado de mails ----------
-function armarHtml(c) {
+const MESES = ['ene', 'feb', 'mar', 'abr', 'may', 'jun', 'jul', 'ago', 'sept', 'oct', 'nov', 'dic'];
+const fechaLarga = iso => { const [y, m, d] = String(iso).slice(0, 10).split('-'); return `${d} de ${MESES[+m - 1]} de ${y}`; };
+const fmtCorto = (n, moneda) => (moneda === 'USD' ? 'USD ' : '$') +
+  n.toLocaleString('es-AR', { minimumFractionDigits: n % 1 ? 2 : 0, maximumFractionDigits: 2 });
+const nombreSaludo = c => {
+  const n = String(c.contacto || '').trim().split(/\s+/)[0];
+  return n ? n.charAt(0).toUpperCase() + n.slice(1).toLowerCase() : c.empresa;
+};
+const nombresAdjuntos = c => [
+  ...c.facturas.map(f => `${f.nro}.pdf`),
+  ...(c.totales.ARS > 0 ? ['Datos bancarios CBU'] : []),
+  ...(c.totales.USD > 0 ? ['Datos bancarios Mercury'] : []),
+];
+
+function armarHtml(c, adjuntos) {
   const { tipoMail, empresa, facturas } = c;
   const mora = tipoMail === 'mora';
-  const filas = facturas.map(f => `
-    <tr>
-      <td style="padding:8px;border-bottom:1px solid #e5e5e5">${esc(f.nro)}</td>
-      <td style="padding:8px;border-bottom:1px solid #e5e5e5">${fechaAR(f.venc)}</td>
-      <td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${fmt(f.importe, f.moneda)}</td>
-      ${mora ? `<td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${f.meses || 0}</td>
-      <td style="padding:8px;border-bottom:1px solid #e5e5e5;text-align:right">${fmt(f.interes || 0, f.moneda)}</td>` : ''}
-    </tr>`).join('');
-  const th = s => `<th style="padding:8px;text-align:left;background:#f3f5f2;border-bottom:1px solid #d5d9d3">${s}</th>`;
-  const tabla = `<table style="border-collapse:collapse;width:100%;font-size:14px;margin:16px 0">
-    <tr>${th('Factura')}${th('Vencimiento')}${th('Importe')}${mora ? th('Meses') + th('Interés') : ''}</tr>${filas}</table>`;
+  const n = facturas.length;
+  const sede = (c.sedes || [])[0] || '';
+  const ccSede = (c.cc || []).find(e => !CC_FIJOS.includes(e)) || '';
+  const monedas = ['ARS', 'USD'].filter(m => c.totales[m] > 0);
+  const F = 'font-family:Arial,Helvetica,sans-serif;';
+  const MONO = "font-family:'SFMono-Regular',Menlo,Consolas,monospace;";
+  const ROJO = '#C0392B', GRIS = '#8A8A8A', BEIGE = '#F5F2EC', LINEA = '#E8E3DA';
 
-  const totales = m => {
-    const lista = ['ARS', 'USD'].filter(mon => c.totales[mon] > 0);
-    return lista.map(mon => m(mon)).join('<br>');
+  const badge = d => {
+    if (d <= 0) return `<span style="background:#E3F1E4;color:#2E7D32;font-size:11px;font-weight:bold;padding:2px 7px;border-radius:4px">${d === 0 ? 'hoy' : 'vigente'}</span>`;
+    const [bg, fg] = d > 30 ? ['#FBE3E1', ROJO] : ['#FBF0D9', '#B7791F'];
+    return `<span style="background:${bg};color:${fg};font-size:11px;font-weight:bold;padding:2px 7px;border-radius:4px">${d}d</span>`;
   };
+  const td = (s, extra = '') => `<td style="padding:12px 14px;border-top:1px solid ${LINEA};font-size:13px;${extra}">${s}</td>`;
+  const th = (s, extra = '') => `<td style="padding:10px 14px;border-top:1px solid ${LINEA};font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};${extra}">${s}</td>`;
 
-  let intro, cierre;
+  const filas = facturas.map(f => `<tr>
+    ${td(esc(f.nro), MONO + 'color:#666')}
+    ${td(fechaLarga(f.venc))}
+    ${td(esc(f.letra || '-'))}
+    ${td(fmtCorto(f.importe, f.moneda), MONO + `color:${ROJO};font-weight:bold;text-align:right`)}
+    ${mora ? td(fmtCorto(f.interes || 0, f.moneda), MONO + 'text-align:right;color:#666') : ''}
+    ${td(badge(f.diasVencida), 'text-align:center')}
+  </tr>`).join('');
+  const filaTotal = monedas.map(m => `<tr style="background:${BEIGE}">
+    <td colspan="3" style="padding:12px 14px;border-top:1px solid ${LINEA};font-weight:bold;font-size:13px">TOTAL${monedas.length > 1 ? ' ' + m : ''}</td>
+    <td style="padding:12px 14px;border-top:1px solid ${LINEA};${MONO}color:${ROJO};font-weight:bold;text-align:right;font-size:13px">${fmtCorto(c.totales[m], m)}</td>
+    ${mora ? `<td style="padding:12px 14px;border-top:1px solid ${LINEA};${MONO}text-align:right;font-size:13px;color:#666">${fmtCorto(c.intereses[m] || 0, m)}</td>` : ''}
+    <td style="border-top:1px solid ${LINEA}"></td></tr>`).join('');
+
+  const unaVarias = (una, varias) => n === 1 ? una : varias;
+  const p = s => `<p style="margin:0 0 12px;font-size:14px;line-height:1.6;color:#333">${s}</p>`;
+  let cuerpo;
   if (tipoMail === 'recordatorio') {
-    intro = `<p>Les recordamos que tienen facturas pendientes con Huerta Coworking. Las facturas del mes vencen el día 10.</p>`;
-    cierre = `<p>Adjuntamos los datos bancarios para realizar el pago. Una vez hecho, les pedimos que nos envíen el comprobante respondiendo este mail.</p><p>Si ya realizaron el pago, por favor desestimen este mensaje.</p>`;
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te recordamos que ${unaVarias('tenés una factura pendiente', `tenés ${n} facturas pendientes`)} en tu cuenta. Las facturas del mes vencen el día 10.`)
+      + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
   } else if (tipoMail === 'reclamo1') {
-    intro = `<p>Al día de hoy registramos las siguientes facturas vencidas e impagas.</p>`;
-    cierre = `<p>Les pedimos regularizar el pago a la brevedad y enviarnos el comprobante respondiendo este mail. Adjuntamos los datos bancarios.</p><p>Si ya realizaron el pago, por favor envíennos el comprobante para registrarlo.</p>`;
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te contactamos porque registramos ${unaVarias('una factura impaga', `${n} facturas impagas`)} en tu cuenta. Te pedimos que regularices la situación a la brevedad.`)
+      + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
   } else if (tipoMail === 'reclamo2') {
-    intro = `<p>Este es el segundo aviso por las siguientes facturas vencidas, que a la fecha siguen sin registrar pago.</p>`;
-    cierre = `<p>Necesitamos que regularicen la deuda dentro de las próximas 48 horas y nos envíen el comprobante respondiendo este mail. Adjuntamos los datos bancarios.</p><p>Si existe algún inconveniente con el pago, respondan este mail para coordinarlo.</p>`;
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te escribimos nuevamente porque ${unaVarias('la factura sigue impaga', `las ${n} facturas siguen impagas`)} a pesar de nuestro aviso anterior. Necesitamos que regularices la situación dentro de las próximas 48 horas.`)
+      + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
   } else {
-    intro = `<p>La cuenta de ${esc(empresa)} registra facturas con más de ${DIAS_MORA} días de atraso y se encuentra en revisión.</p>
-      <p>Sobre el capital adeudado se aplican intereses por actualización (IPC INDEC, acumulado desde el mes siguiente a cada vencimiento).</p>`;
-    cierre = `<p><b>Si cancelan el capital dentro de los próximos 10 días, no se aplicarán los intereses:</b><br>${totales(m => fmt(c.totales[m], m))}</p>
-      <p><b>Pasado ese plazo, el total con intereses es:</b><br>${totales(m => fmt(r2(c.totales[m] + (c.intereses[m] || 0)), m))}</p>
-      <p>Adjuntamos los datos bancarios. Les pedimos que nos envíen el comprobante respondiendo este mail.</p>`;
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, la cuenta de ${esc(empresa)} registra facturas con más de ${DIAS_MORA} días de atraso y se encuentra en revisión.`)
+      + p('Sobre el capital adeudado se aplican intereses por actualización (IPC INDEC), acumulados desde el mes siguiente a cada vencimiento.')
+      + `<table width="100%" cellpadding="0" cellspacing="0" style="margin:4px 0 12px"><tr>
+          <td style="padding:14px;background:${BEIGE};border-radius:6px 0 0 6px;vertical-align:top">
+            <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS}">SI PAGÁS EN 10 DÍAS (SIN INTERESES)</div>
+            <div style="font-size:18px;font-weight:bold;color:#222;margin-top:6px">${monedas.map(m => fmtCorto(c.totales[m], m)).join('<br>')}</div></td>
+          <td style="padding:14px;background:#FBE3E1;border-radius:0 6px 6px 0;vertical-align:top">
+            <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${ROJO}">TOTAL CON INTERESES</div>
+            <div style="font-size:18px;font-weight:bold;color:${ROJO};margin-top:6px">${monedas.map(m => fmtCorto(r2(c.totales[m] + (c.intereses[m] || 0)), m)).join('<br>')}</div></td>
+        </tr></table>`
+      + p('Si ya realizaste el pago, por favor respondé este email con el comprobante.');
   }
-  const totalLinea = mora ? '' : `<p><b>Total pendiente:</b><br>${totales(m => fmt(c.totales[m], m))}</p>`;
 
-  return `<div style="font-family:Arial,Helvetica,sans-serif;font-size:15px;color:#222;max-width:640px;line-height:1.5">
-    <p>Hola ${esc(empresa)},</p>${intro}${tabla}${totalLinea}${cierre}
-    <p>Saludos,<br>Administración<br>Huerta Coworking</p></div>`;
+  const instrucciones = [
+    ...(c.totales.ARS > 0 ? ['Para pagos en pesos, realizá la transferencia bancaria al CBU de Huerta Coworking (adjunto).'] : []),
+    ...(c.totales.USD > 0 ? ['Para pagos en dólares, realizá la transferencia a la cuenta Mercury de Huerta Coworking (adjunto).'] : []),
+  ].map(s => `<div style="font-size:13px;color:#333;margin-top:4px">&bull; ${s}</div>`).join('');
+
+  const listaAdj = (adjuntos || nombresAdjuntos(c)).map(a =>
+    `<span style="display:inline-block;background:#F1EEE8;border-radius:6px;padding:8px 12px;margin:0 6px 6px 0;font-size:12px;font-weight:bold;color:#333">&#128206; ${esc(a)}</span>`).join('');
+
+  const totalHeader = monedas.map(m => `<div style="font-size:24px;font-weight:bold;color:${ROJO};${MONO}">${fmtCorto(c.totales[m], m)}</div>`).join('');
+
+  return `<div style="background:#ffffff;padding:0;margin:0">
+<table width="100%" cellpadding="0" cellspacing="0" style="max-width:640px;margin:0 auto;${F}border-collapse:collapse">
+  <tr><td style="background:#111111;padding:16px 20px">
+    <table width="100%" cellpadding="0" cellspacing="0"><tr>
+      <td width="64"><div style="width:64px;height:64px;background:#ffffff;border-radius:8px;text-align:center;line-height:64px;font-size:34px;color:#111;font-family:Georgia,serif">H</div></td>
+      <td style="text-align:center;color:#ffffff;font-size:18px;font-weight:bold">Huerta Coworking</td>
+      <td width="110" style="text-align:right">${sede ? `<span style="background:#ffffff;color:#C2410C;font-size:12px;font-weight:bold;padding:5px 10px;border-radius:4px">&#128205; ${esc(sede)}</span>` : ''}</td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="background:${BEIGE};padding:18px 26px;border-bottom:1px solid ${LINEA}">
+    <table cellpadding="0" cellspacing="0"><tr>
+      <td style="padding-right:40px;border-right:1px solid #D6D0C4;vertical-align:top">
+        <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:6px">${mora ? 'CAPITAL ADEUDADO' : 'TOTAL PENDIENTE'}</div>${totalHeader}</td>
+      <td style="padding-left:40px;vertical-align:top;text-align:center">
+        <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:6px">FACTURAS</div>
+        <div style="font-size:24px;font-weight:bold;color:#333">${n}</div></td>
+    </tr></table>
+  </td></tr>
+  <tr><td style="padding:24px 26px 8px">${cuerpo}
+    <table width="100%" cellpadding="0" cellspacing="0" style="border:1px solid ${LINEA};border-radius:8px;border-collapse:separate;margin:8px 0 16px;background:#FBFAF8">
+      <tr><td colspan="${mora ? 6 : 5}" style="padding:12px 14px;font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS}">DETALLE DE FACTURAS &middot; ${esc(empresa.toUpperCase())}</td></tr>
+      <tr>${th('REFERENCIA')}${th('VENCIMIENTO')}${th('TIPO')}${th('MONTO', 'text-align:right')}${mora ? th('INTERÉS', 'text-align:right') : ''}${th('ESTADO', 'text-align:center')}</tr>
+      ${filas}${filaTotal}
+    </table>
+    <div style="border:1px solid #BFE0C3;background:#EEF8EF;border-radius:8px;padding:14px 16px;margin-bottom:20px">
+      <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:#2E7D32">INSTRUCCIONES DE PAGO</div>${instrucciones}
+    </div>
+    <div style="border-top:1px solid ${LINEA};padding-top:14px;margin-bottom:16px">
+      <div style="font-size:10px;font-weight:bold;letter-spacing:1px;color:${GRIS};margin-bottom:10px">ADJUNTOS</div>${listaAdj}
+    </div>
+  </td></tr>
+  <tr><td style="background:${BEIGE};padding:14px 26px;font-size:11px;color:${GRIS}">
+    ${sede ? `&#128205; ${esc(sede)}` : 'Huerta Coworking'}${ccSede ? ` &middot; <a href="mailto:${ccSede}" style="color:#1a56db">${ccSede}</a>` : ''}
+  </td></tr>
+</table></div>`;
 }
 
 // ---------- Rutas ----------
@@ -394,11 +470,12 @@ module.exports = function montarReclamos(app, pool) {
       const [ovr, facEm, cliEm] = await Promise.all([
         pool.query(`SELECT id_cliente, email FROM reclamos_contactos`),
         pool.query(`SELECT DISTINCT ON (lower(trim(empresa))) lower(trim(empresa)) k, email FROM facturas WHERE email <> '' ORDER BY lower(trim(empresa)), created_at DESC`),
-        pool.query(`SELECT lower(trim(empresa)) k, email FROM clientes WHERE email <> ''`),
+        pool.query(`SELECT lower(trim(empresa)) k, email, contacto FROM clientes`),
       ]);
       const mOvr = new Map(ovr.rows.map(r => [r.id_cliente, r.email]));
       const mFac = new Map(facEm.rows.map(r => [claveEmpresa(r.k), r.email]));
       const mCli = new Map(cliEm.rows.map(r => [claveEmpresa(r.k), r.email]));
+      const mContacto = new Map(cliEm.rows.map(r => [claveEmpresa(r.k), r.contacto]));
 
       const recientes = await pool.query(
         `SELECT DISTINCT id_cliente FROM reclamos_envios WHERE estado='enviado' AND created_at > NOW() - ($1 || ' hours')::interval`,
@@ -444,7 +521,7 @@ module.exports = function montarReclamos(app, pool) {
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
-          idCliente: c.idCliente, empresa: c.empresa, email, emailOrigen: origen, cc,
+          idCliente: c.idCliente, empresa: c.empresa, contacto: mContacto.get(k) || '', email, emailOrigen: origen, cc,
           sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
           facturas, totales, intereses, problemas, bloqueado: yaEnviados.has(c.idCliente),
         };
@@ -543,7 +620,7 @@ module.exports = function montarReclamos(app, pool) {
       const sinPdf = [];
       for (const f of m.facturas) {
         const buf = await colppyPdfFactura(f.idFactura, idCliente);
-        if (buf) adjuntos.push({ filename: `Factura ${f.letra ? f.letra + ' ' : ''}${f.nro}.pdf`, buf });
+        if (buf) adjuntos.push({ filename: `${f.nro}.pdf`, buf });
         else sinPdf.push(f.nro);
       }
       const bancos = await pool.query(`SELECT tipo, nombre, url FROM pdfs_banco`);
@@ -555,7 +632,7 @@ module.exports = function montarReclamos(app, pool) {
         }
       }
 
-      const raw = armarMime({ fromEmail: fromEmail || process.env.GMAIL_FROM, to, toName: m.empresa, cc: m.cc, subject: m.asunto, html: armarHtml(m), adjuntos });
+      const raw = armarMime({ fromEmail: fromEmail || process.env.GMAIL_FROM, to, toName: m.empresa, cc: m.cc, subject: m.asunto, html: armarHtml(m, adjuntos.map(a => a.filename)), adjuntos });
       if (raw.length > 24 * 1024 * 1024) throw new Error(`El mail de ${m.empresa} supera 24 MB`);
       const messageId = await gmailEnviar(token, raw);
 
