@@ -330,16 +330,18 @@ async function buscarUSDenFactura(idFactura) {
   return null;
 }
 
-function aplicarMoneda(f) {
-  if (f.usdFactura) {
-    f.moneda = 'USD';
-    f.importe = r2(f.usdFactura * (f.totalARS ? f.saldoARS / f.totalARS : 1));
-    f.faltaUSD = false;
-  } else if (SIEMPRE_USD.includes(f.letra)) {
-    f.moneda = 'USD'; f.importe = 0; f.faltaUSD = true;
-  } else {
-    f.moneda = 'ARS'; f.importe = f.saldoARS; f.faltaUSD = false;
-  }
+// Una sola moneda por cliente: ARS si tiene alguna A o B; si no, USD cuando sus facturas son en dólares
+function monedaCliente(facturas) {
+  if (facturas.some(f => f.letra === 'A' || f.letra === 'B')) return 'ARS';
+  if (facturas.some(f => SIEMPRE_USD.includes(f.letra) || f.usdFactura)) return 'USD';
+  return 'ARS';
+}
+
+function aplicarMoneda(f, moneda) {
+  if (moneda === 'ARS') { f.moneda = 'ARS'; f.importe = f.saldoARS; f.faltaUSD = false; return; }
+  f.moneda = 'USD';
+  if (f.usdFactura) { f.importe = r2(f.usdFactura * (f.totalARS ? f.saldoARS / f.totalARS : 1)); f.faltaUSD = false; }
+  else { f.importe = 0; f.faltaUSD = true; }
 }
 
 function calcularTotales(m, ipc, hoy) {
@@ -689,9 +691,10 @@ module.exports = function montarReclamos(app, pool) {
       // Montos USD: cargados a mano, o buscados dentro de la factura
       const manual = new Map((await pool.query(`SELECT id_factura, usd FROM reclamos_usd`)).rows.map(r => [r.id_factura, +r.usd]));
       const buscar = [];
-      for (const c of porCliente.values()) for (const f of c.facturas) {
-        if (manual.has(f.idFactura)) { f.usdFactura = manual.get(f.idFactura); f.usdOrigen = 'cargado'; }
-        else if (!f.usdFactura && SIEMPRE_USD.includes(f.letra)) buscar.push(f);
+      for (const c of porCliente.values()) {
+        for (const f of c.facturas) if (manual.has(f.idFactura)) { f.usdFactura = manual.get(f.idFactura); f.usdOrigen = 'cargado'; }
+        c.moneda = monedaCliente(c.facturas);
+        if (c.moneda === 'USD') for (const f of c.facturas) if (!f.usdFactura) buscar.push(f);
       }
       for (let i = 0; i < buscar.length; i += 4) {
         await Promise.all(buscar.slice(i, i + 4).map(async f => {
@@ -699,7 +702,7 @@ module.exports = function montarReclamos(app, pool) {
           catch (e) { console.warn('USD no encontrado', f.nro, e.message); }
         }));
       }
-      for (const c of porCliente.values()) c.facturas.forEach(aplicarMoneda);
+      for (const c of porCliente.values()) c.facturas.forEach(f => aplicarMoneda(f, c.moneda));
 
       // Emails guardados
       const [ovr, facEm, cliEm] = await Promise.all([
@@ -728,7 +731,7 @@ module.exports = function montarReclamos(app, pool) {
         facturas.sort((a, b) => a.venc.localeCompare(b.venc));
 
         const k = claveEmpresa(c.empresa);
-        const tieneUSD = facturas.some(f => f.moneda === 'USD');
+        const tieneUSD = c.moneda === 'USD';
         let email = [], origen = '';
         const candidatos = [
           ['editado', mOvr.get(c.idCliente)],
@@ -742,7 +745,7 @@ module.exports = function montarReclamos(app, pool) {
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
-          idCliente: c.idCliente, empresa: c.empresa, contacto: mContacto.get(k) || '', email, emailOrigen: origen, cc,
+          idCliente: c.idCliente, moneda: c.moneda, empresa: c.empresa, contacto: mContacto.get(k) || '', email, emailOrigen: origen, cc,
           sedes: sedes.map(s => s.sede), tipoMail, asunto: TIPOS[tipoMail].asunto(c.empresa),
           facturas, problemas, bloqueado: yaEnviados.has(c.idCliente),
         };
@@ -888,7 +891,7 @@ module.exports = function montarReclamos(app, pool) {
       await pool.query(`INSERT INTO reclamos_usd (id_factura, nro, usd, updated_at) VALUES ($1,$2,$3,NOW())
         ON CONFLICT (id_factura) DO UPDATE SET usd=$3, updated_at=NOW()`, [idFactura, f.nro, usd]);
       f.usdFactura = usd; f.usdOrigen = 'cargado';
-      aplicarMoneda(f);
+      aplicarMoneda(f, m.moneda || 'USD');
       calcularTotales(m, await leerIPC(), hoyAR());
       await pool.query(`UPDATE reclamos_lotes SET data=$2 WHERE id=$1`, [loteId, JSON.stringify(mails)]);
       res.json({ ok: true, mail: m });
