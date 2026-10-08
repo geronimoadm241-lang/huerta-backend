@@ -596,6 +596,9 @@ module.exports = function montarReclamos(app, pool) {
     CREATE UNIQUE INDEX IF NOT EXISTS reclamos_envios_lote_cliente ON reclamos_envios(lote_id, id_cliente);
     CREATE INDEX IF NOT EXISTS reclamos_envios_cliente_fecha ON reclamos_envios(id_cliente, created_at);
     CREATE TABLE IF NOT EXISTS reclamos_contactos (id_cliente TEXT PRIMARY KEY, email TEXT, updated_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
+      interes NUMERIC, factura_interes TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE INDEX IF NOT EXISTS reclamos_intereses_factura ON reclamos_intereses(id_factura);
     CREATE TABLE IF NOT EXISTS reclamos_usd (id_factura TEXT PRIMARY KEY, nro TEXT, usd NUMERIC, updated_at TIMESTAMPTZ DEFAULT NOW());
   `).then(() => console.log('Reclamos: tablas listas')).catch(e => console.error('Reclamos: error creando tablas', e.message));
 
@@ -908,6 +911,62 @@ module.exports = function montarReclamos(app, pool) {
       calcularTotales(m, await leerIPC(), hoyAR());
       await pool.query(`UPDATE reclamos_lotes SET data=$2 WHERE id=$1`, [loteId, JSON.stringify(mails)]);
       res.json({ ok: true, mail: m });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Intereses de mora para facturar (descuenta lo ya facturado)
+  async function interesesDeLote(loteId) {
+    const mails = await leerLote(loteId);
+    const ipc = await leerIPC(), hoy = hoyAR();
+    const ya = await pool.query(`SELECT id_factura, SUM(interes) total, MAX(created_at) ultima, STRING_AGG(DISTINCT factura_interes, ', ') facturas
+      FROM reclamos_intereses GROUP BY id_factura`);
+    const mYa = new Map(ya.rows.map(r => [r.id_factura, r]));
+    let ipcIncompleto = false;
+    const clientes = [];
+    for (const m of mails.filter(x => x.tipoMail === 'mora')) {
+      const filas = [];
+      for (const f of m.facturas) {
+        if (f.faltaUSD || f.diasVencida <= 0) continue;
+        const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
+        if (i.usaFallback) ipcIncompleto = true;
+        const prev = mYa.get(f.idFactura);
+        const facturado = r2(+(prev?.total || 0));
+        const aFacturar = r2(Math.max(0, i.interes - facturado));
+        filas.push({ idFactura: f.idFactura, nro: f.nro, letra: f.letra, emision: f.emision, venc: f.venc, diasVencida: f.diasVencida,
+          capital: f.importe, meses: i.meses, interes: i.interes, facturado, aFacturar, facturasInteres: prev?.facturas || '' });
+      }
+      if (!filas.length) continue;
+      const moneda = m.moneda || m.facturas[0].moneda;
+      const total = r2(filas.reduce((t, f) => t + f.aFacturar, 0));
+      const nros = filas.filter(f => f.aFacturar > 0).map(f => f.nro);
+      clientes.push({
+        idCliente: m.idCliente, empresa: m.empresa, sedes: m.sedes, moneda, filas, totalAFacturar: total,
+        concepto: nros.length ? `Intereses por mora (actualización IPC) s/ facturas ${nros.join(', ')} al ${fechaAR(hoy)}` : '',
+      });
+    }
+    clientes.sort((a, b) => b.totalAFacturar - a.totalAFacturar);
+    return { hoy, ipcIncompleto, tasaFallback: TASA_FALLBACK, clientes };
+  }
+
+  app.get('/api/reclamos/intereses', admin, async (req, res) => {
+    try { res.json(await interesesDeLote(req.query.loteId)); }
+    catch (e) { res.status(400).json({ error: e.message }); }
+  });
+
+  // Registrar que se facturaron los intereses de un cliente
+  app.post('/api/reclamos/intereses/facturado', admin, async (req, res) => {
+    try {
+      const { loteId, idCliente, facturaInteres } = req.body || {};
+      const data = await interesesDeLote(loteId);
+      const c = data.clientes.find(x => x.idCliente === idCliente);
+      if (!c) return res.status(404).json({ error: 'Cliente sin intereses en este lote' });
+      const filas = c.filas.filter(f => f.aFacturar > 0);
+      if (!filas.length) return res.status(400).json({ error: 'No hay intereses pendientes de facturar' });
+      for (const f of filas) {
+        await pool.query(`INSERT INTO reclamos_intereses (id_factura, id_cliente, nro, moneda, interes, factura_interes) VALUES ($1,$2,$3,$4,$5,$6)`,
+          [f.idFactura, idCliente, f.nro, c.moneda, f.aFacturar, String(facturaInteres || '').slice(0, 60)]);
+      }
+      res.json({ ok: true, registrado: c.totalAFacturar });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
