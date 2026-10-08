@@ -144,6 +144,10 @@ async function colppyPdfFactura(idFactura, idCliente) {
       const buf = Buffer.from(await r.arrayBuffer());
       const inicio = buf.subarray(0, 4096).indexOf('%PDF');
       if (r.ok && inicio >= 0) return inicio ? buf.subarray(inicio) : buf;
+      if (/no es electr/i.test(buf.toString('utf8'))) {
+        try { return await colppyPdfGenerado(idFactura, idCliente); }
+        catch (e) { ultimoErrorPdf = 'Factura no electrónica y no se pudo generar el PDF: ' + e.message; return null; }
+      }
       ultimoErrorPdf = `HTTP ${r.status}, tipo ${r.headers.get('content-type') || '?'}, ${buf.length} bytes: ` +
         buf.subarray(0, 160).toString('utf8').replace(/\s+/g, ' ').trim();
       console.warn('PDF Colppy falló', idFactura, ultimoErrorPdf);
@@ -153,6 +157,105 @@ async function colppyPdfFactura(idFactura, idCliente) {
     }
   }
   return null;
+}
+
+// ---------- PDF propio para facturas no electrónicas ----------
+function pdfDesdeDatos(info, items, cliente) {
+  const PDFDocument = require('pdfkit');
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 48 });
+    const partes = [];
+    doc.on('data', b => partes.push(b));
+    doc.on('end', () => resolve(Buffer.concat(partes)));
+    doc.on('error', reject);
+
+    const W = doc.page.width - 96, X = 48;
+    const n = v => (+v || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+    const letra = String(info.idTipoFactura || '').length === 1 ? info.idTipoFactura : '';
+    const usd = parseUSD(info.descripcion);
+
+    // Encabezado
+    doc.font('Helvetica-Bold').fontSize(20).fillColor('#111').text('HUERTA', X, 50);
+    doc.font('Helvetica').fontSize(9).fillColor('#666').text('COWORKING', X, 73);
+    if (letra) {
+      doc.rect(X + W / 2 - 22, 46, 44, 44).lineWidth(1).stroke('#111');
+      doc.font('Helvetica-Bold').fontSize(26).fillColor('#111').text(letra, X + W / 2 - 22, 55, { width: 44, align: 'center' });
+    }
+    doc.font('Helvetica-Bold').fontSize(16).fillColor('#111').text('Factura', X + W / 2 + 40, 48, { width: W / 2 - 40, align: 'right' });
+    doc.font('Helvetica').fontSize(10).fillColor('#333')
+      .text(`N° ${info.nroFactura}`, X + W / 2 + 40, 70, { width: W / 2 - 40, align: 'right' })
+      .text(`Fecha: ${String(info.fechaFactura).replace(/-/g, '/')}`, { width: W / 2 - 40, align: 'right' })
+      .text(`Vencimiento: ${String(info.fechaPago).replace(/-/g, '/')}`, { width: W / 2 - 40, align: 'right' });
+    doc.moveTo(X, 118).lineTo(X + W, 118).lineWidth(0.5).stroke('#999');
+
+    // Cliente
+    let y = 132;
+    doc.font('Helvetica-Bold').fontSize(9).fillColor('#666').text('CLIENTE', X, y);
+    y += 14;
+    doc.font('Helvetica-Bold').fontSize(11).fillColor('#111').text(cliente.RazonSocial || '', X, y, { width: W });
+    y = doc.y + 2;
+    const dir = [cliente.DirFiscal || cliente.DirPostal, cliente.DirFiscalCiudad || cliente.DirPostalCiudad].filter(Boolean).join(', ');
+    doc.font('Helvetica').fontSize(9).fillColor('#444');
+    if (cliente.CUIT) { doc.text(`CUIT: ${cliente.CUIT}`, X, y); y = doc.y; }
+    if (dir) { doc.text(dir, X, y, { width: W }); y = doc.y; }
+    doc.text(`Condición de pago: ${info.idCondicionPago || '-'}`, X, y);
+    y = doc.y + 18;
+
+    // Ítems
+    const cols = [{ t: 'Descripción', w: W * 0.52, a: 'left' }, { t: 'Cant.', w: W * 0.1, a: 'right' },
+      { t: 'Precio unit.', w: W * 0.19, a: 'right' }, { t: 'Importe', w: W * 0.19, a: 'right' }];
+    doc.rect(X, y, W, 20).fill('#F1EEE8');
+    let cx = X;
+    doc.font('Helvetica-Bold').fontSize(9).fillColor('#333');
+    for (const c of cols) { doc.text(c.t, cx + 6, y + 6, { width: c.w - 12, align: c.a }); cx += c.w; }
+    y += 26;
+    doc.font('Helvetica').fontSize(10).fillColor('#111');
+    for (const it of items) {
+      const cant = +it.Cantidad || 0, pu = +it.ImporteUnitario || 0;
+      const vals = [it.Descripcion + (it.Comentario ? `\n${it.Comentario}` : ''), String(+cant.toFixed(2)), n(pu), n(cant * pu * (1 - (+it.porcDesc || 0) / 100))];
+      const h = Math.max(...vals.map((v, i) => doc.heightOfString(v, { width: cols[i].w - 12 })));
+      cx = X;
+      vals.forEach((v, i) => { doc.text(v, cx + 6, y, { width: cols[i].w - 12, align: cols[i].a }); cx += cols[i].w; });
+      y += h + 10;
+      doc.moveTo(X, y - 5).lineTo(X + W, y - 5).lineWidth(0.3).stroke('#ccc');
+    }
+
+    // Totales
+    y += 8;
+    const fila = (label, valor, bold) => {
+      doc.font(bold ? 'Helvetica-Bold' : 'Helvetica').fontSize(bold ? 12 : 10).fillColor('#111');
+      doc.text(label, X + W * 0.5, y, { width: W * 0.3, align: 'right' });
+      doc.text(valor, X + W * 0.8, y, { width: W * 0.2, align: 'right' });
+      y += bold ? 20 : 16;
+    };
+    if (+info.netoGravado) fila('Neto gravado', '$ ' + n(info.netoGravado));
+    if (+info.netoNoGravado) fila('No gravado', '$ ' + n(info.netoNoGravado));
+    if (+info.totalIVA) fila('IVA', '$ ' + n(info.totalIVA));
+    fila('Total', '$ ' + n(info.totalFactura), true);
+    if (usd) fila('Total en dólares', 'USD ' + n(usd), true);
+
+    doc.font('Helvetica').fontSize(8).fillColor('#888')
+      .text('Huerta Coworking', X, doc.page.height - 70, { width: W, align: 'center' });
+    doc.end();
+  });
+}
+
+async function colppyPdfGenerado(idFactura, idCliente) {
+  const [f, cliente] = await Promise.all([
+    colppyRaw2('FacturaVenta', 'leer_facturaventa', { idFactura: String(idFactura) }),
+    colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) }).catch(() => ({})),
+  ]);
+  if (!f?.infofactura) throw new Error('Colppy no devolvió los datos de la factura');
+  return pdfDesdeDatos(f.infofactura, f.itemsFactura || [], cliente || {});
+}
+
+// leer_facturaventa devuelve los datos fuera de response.data
+async function colppyRaw2(provision, operacion, params) {
+  const build = async force => ({ sesion: await colppyGetSesion(force), idEmpresa: COLPPY_ID_EMPRESA, ...params });
+  let r = await colppyRaw(provision, operacion, await build(false));
+  if (colppyFallo(r)) r = await colppyRaw(provision, operacion, await build(true));
+  if (colppyFallo(r)) throw new Error(`Colppy ${provision}/${operacion}: ${r?.response?.message || 'error'}`);
+  return r.response;
 }
 
 // ---------- Gmail con refresh token ----------
@@ -683,4 +786,4 @@ module.exports = function montarReclamos(app, pool) {
   });
 };
 
-module.exports._test = { parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
+module.exports._test = { pdfDesdeDatos, parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
