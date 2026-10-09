@@ -294,6 +294,99 @@ async function colppyAdjunto(f) {
 }
 
 // Facturas no electrónicas: primero el adjunto original, si no, PDF generado con los datos de Colppy
+// Invoice en dólares de Z Performance LLC (facturas T), igual al que recibe el cliente
+const MESES_ES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
+function fechaInvoice(f) {
+  const t = String(f || '');
+  let y, m, d;
+  if (/^\d{4}-\d{2}-\d{2}/.test(t)) [y, m, d] = t.slice(0, 10).split('-').map(Number);
+  else if (/^\d{2}-\d{2}-\d{4}/.test(t)) [d, m, y] = t.slice(0, 10).split('-').map(Number);
+  else return t;
+  return `${MESES_ES[m - 1]} ${d} - ${y}`;
+}
+const limpiarConcepto = t => String(t || '').replace(/\s*\([^)]*(usd|u\$s|d[oó]lar)[^)]*\)?\s*/gi, ' ').replace(/\s+/g, ' ').trim();
+
+function pdfInvoiceZ(info, items, cliente, usdTotal, sede) {
+  const PDFDocument = require('pdfkit');
+  return new Promise((resolve, reject) => {
+    const doc = new PDFDocument({ size: 'A4', margin: 0 });
+    const partes = [];
+    doc.on('data', b => partes.push(b));
+    doc.on('end', () => resolve(Buffer.concat(partes)));
+    doc.on('error', reject);
+
+    const X = 60, W = doc.page.width - 120, R = X + W;
+    const OSC = '#111827', GRIS = '#6B7280', CLARO = '#9CA3AF', AZUL = '#3B82F6', LINEA = '#E5E7EB';
+    const n = v => (+v || 0).toLocaleString('es-AR', { minimumFractionDigits: 2, maximumFractionDigits: 2 });
+
+    // Emisor
+    doc.font('Helvetica-Bold').fontSize(17).fillColor(OSC).text('Z Performance LLC', X, 50);
+    doc.font('Helvetica').fontSize(9.5).fillColor('#374151')
+      .text('Huerta Coworking.', X, 76).text('16192 Coastal Highway,', X, 90).text('City of Lewes, DE 19958', X, 104);
+    // INVOICE
+    doc.font('Helvetica-Bold').fontSize(30).fillColor(OSC).text('INVOICE', X, 50, { width: W, align: 'right', characterSpacing: 1 });
+    doc.font('Helvetica-Bold').fontSize(7).fillColor('#374151');
+    doc.text('INVOICE #', R - 225, 96, { width: 100, align: 'right' });
+    doc.text('DATE', R - 100, 96, { width: 100, align: 'right' });
+    doc.font('Courier').fontSize(9).fillColor(GRIS).text(info.nroFactura || '', R - 235, 110, { width: 110, align: 'right' });
+    doc.font('Helvetica').fontSize(9.5).fillColor(CLARO).text(fechaInvoice(info.fechaFactura), R - 110, 110, { width: 110, align: 'right' });
+
+    // Razón social
+    let y = 160;
+    const lineasCli = [];
+    const taxId = cliente.CUIT || cliente.NroDocumento || '';
+    if (taxId) lineasCli.push(`TAX ID: ${taxId}`);
+    const dir = [cliente.DirFiscal || cliente.DirPostal, cliente.DirFiscalCiudad || cliente.DirPostalCiudad, cliente.DirFiscalPais || cliente.DirPostalPais].filter(Boolean).join(', ');
+    if (dir) lineasCli.push(`Dirección: ${dir}`);
+    const altoBloque = 44 + lineasCli.length * 12;
+    doc.save().roundedRect(X, y, 3, altoBloque, 1.5).fill(AZUL).restore();
+    doc.font('Helvetica-Bold').fontSize(7).fillColor('#374151').text('RAZÓN SOCIAL', X + 18, y + 10);
+    doc.font('Helvetica-Bold').fontSize(13).fillColor(OSC).text(cliente.RazonSocial || '', X + 18, y + 22, { width: W - 18 });
+    doc.font('Helvetica').fontSize(9).fillColor('#374151');
+    lineasCli.forEach((l, i) => doc.text(l, X + 18, y + 40 + i * 12, { width: W - 18 }));
+    y += altoBloque + 32;
+
+    // Ítems en USD (si el ítem no dice usd, se reparte el total USD en proporción a pesos)
+    const totalARS = +info.totalFactura || 0;
+    const filas = (items.length ? items : [{ Descripcion: info.descripcion, Cantidad: 1, ImporteUnitario: totalARS }]).map(it => {
+      const cant = +it.Cantidad || 1;
+      const ars = cant * (+it.ImporteUnitario || 0) * (1 - (+it.porcDesc || 0) / 100);
+      let usd = parseUSD(`${it.Descripcion || ''} ${it.Comentario || ''}`);
+      usd = usd ? usd * cant : (usdTotal && totalARS ? usdTotal * ars / totalARS : 0);
+      return { desc: limpiarConcepto(it.Descripcion), cant, unit: usd / cant, imp: usd };
+    });
+    const totalUSD = usdTotal || filas.reduce((t, f) => t + f.imp, 0);
+
+    const cols = [{ t: 'DESCRIPCIÓN', w: W * 0.5, a: 'left' }, { t: 'CANT', w: W * 0.1, a: 'center' }, { t: 'PRECIO UNIT.', w: W * 0.2, a: 'right' }, { t: 'IMPORTE', w: W * 0.2, a: 'right' }];
+    let cx = X;
+    doc.font('Helvetica-Bold').fontSize(7.5).fillColor(CLARO);
+    cols.forEach(c => { doc.text(c.t, cx + 10, y, { width: c.w - 20, align: c.a, characterSpacing: 0.5 }); cx += c.w; });
+    y += 26;
+    for (const f of filas) {
+      const h = Math.max(14, doc.font('Helvetica').fontSize(9.5).heightOfString(f.desc, { width: cols[0].w - 20 }));
+      cx = X;
+      doc.font('Helvetica').fontSize(9.5).fillColor('#374151').text(f.desc, cx + 10, y, { width: cols[0].w - 20 }); cx += cols[0].w;
+      doc.text(String(+f.cant.toFixed(2)), cx + 10, y, { width: cols[1].w - 20, align: 'center' }); cx += cols[1].w;
+      doc.font('Courier').fontSize(9.5).fillColor(GRIS).text(n(f.unit), cx + 10, y, { width: cols[2].w - 20, align: 'right' }); cx += cols[2].w;
+      doc.font('Courier-Bold').fontSize(9.5).fillColor(OSC).text(n(f.imp), cx + 10, y, { width: cols[3].w - 20, align: 'right' });
+      y += h + 14;
+    }
+    doc.moveTo(X, y).lineTo(R, y).lineWidth(1).stroke(LINEA);
+    y += 14;
+    doc.font('Helvetica').fontSize(9.5).fillColor('#374151').text('Subtotal', X + W * 0.6, y, { width: W * 0.2 });
+    doc.font('Courier').fontSize(9.5).fillColor(GRIS).text(n(totalUSD), X + W * 0.8, y, { width: W * 0.2 - 10, align: 'right' });
+    y += 30;
+    doc.font('Helvetica-Bold').fontSize(13).fillColor(CLARO).text('TOTAL', X + W * 0.6, y - 2, { width: W * 0.2 });
+    doc.font('Courier-Bold').fontSize(12).fillColor(CLARO).text(`USD ${n(totalUSD)}`, X + W * 0.6, y, { width: W * 0.4 - 10, align: 'right' });
+
+    // Pie
+    doc.font('Helvetica-Oblique').fontSize(12).fillColor('#1E40AF').text('Thank you for your business!', X, 560, { width: W, align: 'center' });
+    doc.font('Courier').fontSize(7.5).fillColor(GRIS).text(`Factura T ${info.nroFactura || ''}${sede ? ' · ' + sede : ''}`, X, 582, { width: W, align: 'center', characterSpacing: 0.5 });
+    doc.font('Helvetica').fontSize(6.5).fillColor(CLARO).text('Invoice creado por Geronimo adm', X, doc.page.height - 70, { width: W, align: 'center' });
+    doc.end();
+  });
+}
+
 async function colppyPdfNoElectronica(idFactura, idCliente) {
   const f = await colppyRaw2('FacturaVenta', 'leer_facturaventa', { idFactura: String(idFactura) });
   if (!f?.infofactura) throw new Error('Colppy no devolvió los datos de la factura');
@@ -302,8 +395,21 @@ async function colppyPdfNoElectronica(idFactura, idCliente) {
   const cliente = await colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) }).catch(() => ({}));
   ultimoOrigenPdf = 'generado';
   ultimoErrorPdf = adj.detalle;
-  return pdfDesdeDatos(f.infofactura, f.itemsFactura || [], cliente || {});
+  const info = f.infofactura;
+  if (String(info.idTipoFactura).toUpperCase() === 'T' || info.idTipoFactura === '8') {
+    let usd = parseUSD(info.descripcion);
+    if (!usd) {
+      let suma = 0;
+      for (const it of f.itemsFactura || []) { const u = parseUSD(`${it.Descripcion || ''} ${it.Comentario || ''}`); if (u) suma += u * (+it.Cantidad || 1); }
+      usd = suma || null;
+    }
+    if (!usd && obtenerUSDManual) usd = await obtenerUSDManual(idFactura);
+    const sede = sedeDePV(String(info.nroFactura || '').split('-')[0])?.sede || '';
+    return pdfInvoiceZ(info, f.itemsFactura || [], cliente || {}, usd, sede);
+  }
+  return pdfDesdeDatos(info, f.itemsFactura || [], cliente || {});
 }
+let obtenerUSDManual = null;
 
 // leer_facturaventa devuelve los datos fuera de response.data
 async function colppyRaw2(provision, operacion, params) {
@@ -596,6 +702,7 @@ function armarHtml(c, adjuntos) {
 
 // ---------- Rutas ----------
 module.exports = function montarReclamos(app, pool) {
+  obtenerUSDManual = async id => { try { const r = await pool.query(`SELECT usd FROM reclamos_usd WHERE id_factura=$1`, [String(id)]); return r.rows[0] ? +r.rows[0].usd : null; } catch { return null; } };
   const admin = (req, res, next) => {
     const k = req.get('x-admin-key') || '';
     const ok = ADMIN_KEY && k.length === ADMIN_KEY.length && crypto.timingSafeEqual(Buffer.from(k), Buffer.from(ADMIN_KEY));
@@ -1159,4 +1266,4 @@ module.exports = function montarReclamos(app, pool) {
   });
 };
 
-module.exports._test = { usdEnTexto, pdfDesdeDatos, parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
+module.exports._test = { pdfInvoiceZ, usdEnTexto, pdfDesdeDatos, parseUSD, calcularIntereses, armarHtml, armarMime, limpiarEmails };
