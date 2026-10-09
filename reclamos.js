@@ -294,7 +294,7 @@ async function colppyAdjunto(f) {
 }
 
 // Facturas no electrónicas: primero el adjunto original, si no, PDF generado con los datos de Colppy
-// Invoice en dólares de Z Performance LLC (facturas T), igual al que recibe el cliente
+// Invoice en dólares de Z Performance LLC (facturas T, I y M), igual al que recibe el cliente
 const MESES_ES = ['enero', 'febrero', 'marzo', 'abril', 'mayo', 'junio', 'julio', 'agosto', 'septiembre', 'octubre', 'noviembre', 'diciembre'];
 function fechaInvoice(f) {
   const t = String(f || '');
@@ -306,7 +306,7 @@ function fechaInvoice(f) {
 }
 const limpiarConcepto = t => String(t || '').replace(/\s*\([^)]*(usd|u\$s|d[oó]lar)[^)]*\)?\s*/gi, ' ').replace(/\s+/g, ' ').trim();
 
-function pdfInvoiceZ(info, items, cliente, usdTotal, sede) {
+function pdfInvoiceZ(info, items, cliente, usdTotal, sede, letra = 'T') {
   const PDFDocument = require('pdfkit');
   return new Promise((resolve, reject) => {
     const doc = new PDFDocument({ size: 'A4', margin: 0 });
@@ -381,7 +381,7 @@ function pdfInvoiceZ(info, items, cliente, usdTotal, sede) {
 
     // Pie
     doc.font('Helvetica-Oblique').fontSize(12).fillColor('#1E40AF').text('Thank you for your business!', X, 560, { width: W, align: 'center' });
-    doc.font('Courier').fontSize(7.5).fillColor(GRIS).text(`Factura T ${info.nroFactura || ''}${sede ? ' · ' + sede : ''}`, X, 582, { width: W, align: 'center', characterSpacing: 0.5 });
+    doc.font('Courier').fontSize(7.5).fillColor(GRIS).text(`Factura ${letra} ${info.nroFactura || ''}${sede ? ' · ' + sede : ''}`, X, 582, { width: W, align: 'center', characterSpacing: 0.5 });
     doc.font('Helvetica').fontSize(6.5).fillColor(CLARO).text('Invoice creado por Geronimo adm', X, doc.page.height - 70, { width: W, align: 'center' });
     doc.end();
   });
@@ -396,7 +396,8 @@ async function colppyPdfNoElectronica(idFactura, idCliente) {
   ultimoOrigenPdf = 'generado';
   ultimoErrorPdf = adj.detalle;
   const info = f.infofactura;
-  if (String(info.idTipoFactura).toUpperCase() === 'T' || info.idTipoFactura === '8') {
+  const letraInv = String(info.idTipoFactura || '').length === 1 ? String(info.idTipoFactura).toUpperCase() : (LETRAS[info.idTipoFactura] || '');
+  if (['T', 'I', 'M'].includes(letraInv)) {
     let usd = parseUSD(info.descripcion);
     if (!usd) {
       let suma = 0;
@@ -405,7 +406,7 @@ async function colppyPdfNoElectronica(idFactura, idCliente) {
     }
     if (!usd && obtenerUSDManual) usd = await obtenerUSDManual(idFactura);
     const sede = sedeDePV(String(info.nroFactura || '').split('-')[0])?.sede || '';
-    return pdfInvoiceZ(info, f.itemsFactura || [], cliente || {}, usd, sede);
+    return pdfInvoiceZ(info, f.itemsFactura || [], cliente || {}, usd, sede, letraInv);
   }
   return pdfDesdeDatos(info, f.itemsFactura || [], cliente || {});
 }
