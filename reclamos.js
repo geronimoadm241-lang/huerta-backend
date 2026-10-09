@@ -131,8 +131,8 @@ async function colppyFacturasPendientes() {
   for (let start = 0; ; start += 1000) {
     const data = await colppy('FacturaVenta', 'listar_facturasventa', {
       filter: [
-        { field: 'idEstadoFactura', op: '=', value: '3' }, // 3 = pendiente de cobro
-        { field: 'idTipoComprobante', op: '=', value: '4' }, // 4 = factura (excluye notas de crédito)
+        { field: 'idEstadoFactura', op: 'in', value: "('3','6')" }, // 3 = pendiente, 6 = parcialmente cobrada
+        { field: 'idTipoComprobante', op: 'in', value: "('4','6')" }, // 4 = factura, 6 = nota de débito (excluye notas de crédito)
         { field: 'fechaFactura', op: '<=', value: hoyAR() }, // excluye facturas emitidas a futuro
       ],
       order: { field: ['fechaFactura'], order: 'asc' },
@@ -276,7 +276,7 @@ async function colppyAdjunto(f) {
   for (const force of [false, true]) {
     const s = await colppyGetSesion(force);
     const q = new URLSearchParams({
-      idEmpresa: COLPPY_ID_EMPRESA, idUsuario: s.usuario, tipoComprobante: 'FAV',
+      idEmpresa: COLPPY_ID_EMPRESA, idUsuario: s.usuario, tipoComprobante: info.idTipoComprobante === '6' ? 'NDV' : 'FAV',
       idComprobante: String(info.idFactura), nombreArchivo: f.nombreArchivo, idArchivo: String(f.archivoId),
       usuario: s.usuario, claveSesion: s.claveSesion,
     });
@@ -374,7 +374,7 @@ function calcularTotales(m, ipc, hoy) {
   for (const f of m.facturas) {
     if (f.faltaUSD) continue;
     m.totales[f.moneda] = r2(m.totales[f.moneda] + f.importe);
-    if (m.tipoMail === 'mora') {
+    if (m.tipoMail === 'mora' && !f.esND) {
       const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
       Object.assign(f, { meses: i.meses, interes: i.interes });
       m.intereses[f.moneda] = r2(m.intereses[f.moneda] + i.interes);
@@ -512,7 +512,7 @@ function armarHtml(c, adjuntos) {
     ${td(esc(f.nro), MONO + 'color:#666')}
     ${td(f.emision ? fechaAR(f.emision) : '-', 'color:#666')}
     ${td(fechaAR(f.venc))}
-    ${td(esc(f.letra || '-'))}
+    ${td(f.esND ? 'ND' : esc(f.letra || '-'))}
     ${td(fmtCorto(f.importe, f.moneda), MONO + `color:${ROJO};font-weight:bold;text-align:right`)}
     ${mora ? td(fmtCorto(f.interes || 0, f.moneda), MONO + 'text-align:right;color:#666') : ''}
     ${td(badge(f.diasVencida), 'text-align:center')}
@@ -761,7 +761,7 @@ module.exports = function montarReclamos(app, pool) {
         const fac = {
           idFactura: f.idFactura, nro: f.nroFactura, letra, descripcion: f.descripcion, emision, venc, diasVencida,
           saldoARS: saldo, totalARS: total, usdFactura: esAB ? null : parseUSD(f.descripcion), usdOrigen: '',
-          tieneCAE: !!f.cae, pv,
+          tieneCAE: !!f.cae, pv, esND: f.idTipoComprobante === '6',
         };
         if (fac.usdFactura) fac.usdOrigen = 'concepto';
         if (!porCliente.has(f.idCliente)) porCliente.set(f.idCliente, { idCliente: f.idCliente, empresa: (f.RazonSocial || f.NombreFantasia || '').trim(), facturas: [] });
@@ -1091,7 +1091,7 @@ module.exports = function montarReclamos(app, pool) {
     for (const m of mails.filter(x => x.tipoMail === 'mora')) {
       const filas = [];
       for (const f of m.facturas) {
-        if (f.faltaUSD || f.diasVencida <= 0) continue;
+        if (f.faltaUSD || f.diasVencida <= 0 || f.esND) continue;
         const i = calcularIntereses(f.importe, f.venc, ipc, hoy);
         if (i.usaFallback) ipcIncompleto = true;
         const prev = mYa.get(f.idFactura);
