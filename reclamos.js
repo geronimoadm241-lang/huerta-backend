@@ -722,6 +722,8 @@ module.exports = function montarReclamos(app, pool) {
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS contacto TEXT;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS excluido BOOLEAN DEFAULT FALSE;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS banco TEXT;
+    ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS empresa TEXT;
+    CREATE TABLE IF NOT EXISTS reclamos_excluidos (patron TEXT PRIMARY KEY, nota TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_bancos_reglas (patron TEXT PRIMARY KEY, banco TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
       interes NUMERIC, factura_interes TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
@@ -960,6 +962,18 @@ module.exports = function montarReclamos(app, pool) {
         }));
       }
 
+      // Clientes sin reclamo: por regla de nombre (solapa "Sin reclamo") o excluidos con el tachito
+      const reglasExcl = (await pool.query(`SELECT patron FROM reclamos_excluidos`)).rows.map(r => ({ patron: r.patron, banco: r.patron }));
+      const excluidos = [];
+      for (let i = mails.length - 1; i >= 0; i--) {
+        const m = mails[i];
+        const regla = bancoPorRegla(m.empresa, reglasExcl);
+        if (m.excluido || regla) {
+          excluidos.push({ idCliente: m.idCliente, empresa: m.empresa, motivo: regla ? 'regla' : 'cliente', patron: regla || null, totales: m.totales, facturas: m.facturas.length });
+          mails.splice(i, 1);
+        }
+      }
+      excluidos.sort((a, b) => a.empresa.localeCompare(b.empresa));
       mails.sort((a, b) => (b.tipoMail === 'mora') - (a.tipoMail === 'mora') || a.empresa.localeCompare(b.empresa));
       if (mails.length > MAX_MAILS_POR_LOTE) return res.status(400).json({ error: `El lote tiene ${mails.length} mails, más que el máximo permitido (${MAX_MAILS_POR_LOTE}). Revisá Colppy.` });
 
@@ -977,7 +991,7 @@ module.exports = function montarReclamos(app, pool) {
         totalUSD: r2(mails.reduce((s, m) => s + m.totales.USD, 0)),
         facturas: mails.reduce((s, m) => s + m.facturas.length, 0),
       };
-      res.json({ ok: true, loteId, tipo, resumen, mails });
+      res.json({ ok: true, loteId, tipo, resumen, mails, excluidos });
     } catch (e) {
       console.error('preparar:', e);
       res.status(500).json({ error: e.message });
@@ -1073,6 +1087,36 @@ module.exports = function montarReclamos(app, pool) {
     }
   });
 
+  // Clientes sin reclamo
+  app.get('/api/reclamos/excluidos', admin, async (req, res) => {
+    try {
+      const reglas = (await pool.query(`SELECT patron, nota, created_at FROM reclamos_excluidos ORDER BY created_at DESC`)).rows;
+      const clientes = (await pool.query(`SELECT id_cliente, empresa, updated_at FROM reclamos_contactos WHERE excluido ORDER BY updated_at DESC`)).rows;
+      res.json({ reglas, clientes });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post('/api/reclamos/excluidos', admin, async (req, res) => {
+    try {
+      let patron = String(req.body?.patron || '').trim();
+      const exacto = patron.startsWith('=');
+      const base = normNombre(exacto ? patron.slice(1) : patron);
+      if (base.length < 3) return res.status(400).json({ error: 'Escribí al menos 3 letras del nombre' });
+      patron = (exacto ? '=' : '') + base;
+      await pool.query(`INSERT INTO reclamos_excluidos (patron, nota) VALUES ($1,$2) ON CONFLICT (patron) DO UPDATE SET nota=$2`,
+        [patron, String(req.body?.nota || '').slice(0, 200)]);
+      res.json({ ok: true, patron });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  app.post('/api/reclamos/excluidos/quitar', admin, async (req, res) => {
+    try {
+      if (req.body?.patron) await pool.query(`DELETE FROM reclamos_excluidos WHERE patron=$1`, [req.body.patron]);
+      if (req.body?.idCliente) await pool.query(`UPDATE reclamos_contactos SET excluido=FALSE, updated_at=NOW() WHERE id_cliente=$1`, [String(req.body.idCliente)]);
+      res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
   // Editar datos del cliente para reclamos (email, nombre del saludo, excluir)
   app.post('/api/reclamos/cliente', admin, async (req, res) => {
     try {
@@ -1089,7 +1133,7 @@ module.exports = function montarReclamos(app, pool) {
         cambios.email = e.join(', '); m.email = e; m.emailOrigen = e.length ? 'editado' : '';
       }
       if (req.body.contacto != null) { cambios.contacto = String(req.body.contacto).trim().slice(0, 80); m.contacto = cambios.contacto; }
-      if (req.body.excluido != null) { cambios.excluido = !!req.body.excluido; m.excluido = cambios.excluido; }
+      if (req.body.excluido != null) { cambios.excluido = !!req.body.excluido; m.excluido = cambios.excluido; cambios.empresa = m.empresa; }
       if (req.body.banco != null) {
         const b = BANCOS[req.body.banco] ? req.body.banco : '';
         cambios.banco = b;
