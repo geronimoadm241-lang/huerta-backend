@@ -149,7 +149,7 @@ async function colppyFacturasPendientes() {
 async function colppyEmailCliente(idCliente) {
   try {
     const d = await colppy('Cliente', 'leer_cliente', { idCliente: String(idCliente) });
-    return limpiarEmails(d?.Email);
+    return limpiarEmails(d?.Email).filter(x => !DOMINIO_PROPIO.test(x));
   } catch { return []; }
 }
 
@@ -494,6 +494,53 @@ function calcularTotales(m, ipc, hoy) {
   if (ipcIncompleto) m.problemas.push(`Faltan meses de IPC: se usa ${TASA_FALLBACK}% mensual`);
 }
 
+// ---------- Emails desde los comentarios del cliente en Colppy ----------
+const COLPPY_COMENTARIOS_URL = 'https://login.colppy.com/resources/php/common/listadoComentario.php';
+const DOMINIO_PROPIO = /@huertacoworking\.com$/i;
+let ultimoErrorComentarios = '';
+
+function emailsDeComentarios(texto) {
+  // Intenta leer la estructura (comentario + fecha) para quedarse con el más reciente que tenga emails
+  let lista = null;
+  try {
+    const j = JSON.parse(texto);
+    const buscarArray = o => Array.isArray(o) ? o : (o && typeof o === 'object' ? Object.values(o).map(buscarArray).find(Boolean) : null);
+    lista = buscarArray(j);
+  } catch { /* no es JSON */ }
+  const deTexto = t => limpiarEmails(String(t || '').match(/[^\s@,;:<>"'()\[\]]+@[^\s@,;:<>"'()\[\]]+\.[a-z]{2,}/gi)?.join(' ')).filter(e => !DOMINIO_PROPIO.test(e));
+  if (Array.isArray(lista) && lista.length && typeof lista[0] === 'object') {
+    const items = lista.map(c => {
+      const campos = Object.entries(c || {});
+      const fecha = campos.map(([, v]) => String(v)).find(v => /^\d{4}-\d{2}-\d{2}/.test(v)) || '';
+      // Solo campos de texto del comentario (no el autor/usuario)
+      const texto = campos.filter(([k]) => !/usuario|user|autor|email_?usuario|login/i.test(k)).map(([, v]) => v).join(' ');
+      return { fecha, emails: deTexto(texto) };
+    }).filter(x => x.emails.length);
+    if (items.length) { items.sort((a, b) => b.fecha.localeCompare(a.fecha)); return items[0].emails; }
+    return [];
+  }
+  return deTexto(texto);
+}
+
+async function colppyEmailsComentarios(idCliente) {
+  for (const force of [false, true]) {
+    const s = await colppyGetSesion(force);
+    const body = new URLSearchParams({ idObjeto: String(idCliente), idEmpresa: COLPPY_ID_EMPRESA, idElemento: '3', usuario: s.usuario, claveSesion: s.claveSesion });
+    const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 10000);
+    try {
+      const r = await fetch(`${COLPPY_COMENTARIOS_URL}?${new URLSearchParams({ usuario: s.usuario, claveSesion: s.claveSesion })}`, {
+        method: 'POST', signal: ctrl.signal, body,
+        headers: { ...UA, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' },
+      });
+      const texto = await r.text();
+      if (r.ok && !/<html|sesi[oó]n|login/i.test(texto.slice(0, 300))) { ultimoErrorComentarios = ''; return { ok: true, emails: emailsDeComentarios(texto), crudo: texto.slice(0, 600) }; }
+      ultimoErrorComentarios = `HTTP ${r.status}: ${texto.slice(0, 200).replace(/\s+/g, ' ')}`;
+    } catch (e) { ultimoErrorComentarios = e.name === 'AbortError' ? 'Colppy no respondió a tiempo' : e.message; }
+    finally { clearTimeout(t); }
+  }
+  return { ok: false, emails: [], error: ultimoErrorComentarios };
+}
+
 // ---------- Gmail con refresh token ----------
 function oauthClient() {
   return new google.auth.OAuth2(process.env.GMAIL_CLIENT_ID, process.env.GMAIL_CLIENT_SECRET, GMAIL_REDIRECT);
@@ -725,6 +772,7 @@ module.exports = function montarReclamos(app, pool) {
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS banco TEXT;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS empresa TEXT;
     CREATE TABLE IF NOT EXISTS reclamos_montos (id_factura TEXT PRIMARY KEY, nro TEXT, moneda TEXT, importe NUMERIC, saldo_ars_ref NUMERIC, updated_at TIMESTAMPTZ DEFAULT NOW());
+    CREATE TABLE IF NOT EXISTS reclamos_comentarios (id_cliente TEXT PRIMARY KEY, emails TEXT, ts TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_excluidos (patron TEXT PRIMARY KEY, nota TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_bancos_reglas (patron TEXT PRIMARY KEY, banco TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
@@ -930,6 +978,20 @@ module.exports = function montarReclamos(app, pool) {
         [String(HORAS_BLOQUEO_REENVIO)]);
       const yaEnviados = new Set(recientes.rows.map(r => r.id_cliente));
 
+      // Emails de los comentarios de Colppy (caché de 6 horas)
+      const cache = new Map((await pool.query(`SELECT id_cliente, emails FROM reclamos_comentarios WHERE ts > NOW() - interval '6 hours'`)).rows.map(r => [r.id_cliente, r.emails]));
+      const pedir = [...porCliente.keys()].filter(id => !cache.has(id));
+      let fallasComentarios = 0;
+      for (let i = 0; i < pedir.length; i += 8) {
+        await Promise.all(pedir.slice(i, i + 8).map(async id => {
+          const r = await colppyEmailsComentarios(id);
+          if (!r.ok) { fallasComentarios++; return; }
+          cache.set(id, r.emails.join(', '));
+          await pool.query(`INSERT INTO reclamos_comentarios (id_cliente, emails, ts) VALUES ($1,$2,NOW()) ON CONFLICT (id_cliente) DO UPDATE SET emails=$2, ts=NOW()`, [id, r.emails.join(', ')]);
+        }));
+        if (fallasComentarios && fallasComentarios === Math.min(i + 8, pedir.length)) break; // si falla todo, no insiste
+      }
+
       const mails = [];
       const faltanEmail = [];
       for (const c of porCliente.values()) {
@@ -946,9 +1008,10 @@ module.exports = function montarReclamos(app, pool) {
         let email = [], origen = '';
         const candidatos = [
           ['editado', mOvr.get(c.idCliente)],
+          ['comentarios de Colppy', cache.get(c.idCliente)],
           ...(tieneUSD ? [['contacto USD', mFac.get(k)], ['clientes', mCli.get(k)]] : [['clientes', mCli.get(k)], ['facturas', mFac.get(k)]]),
         ];
-        for (const [o, v] of candidatos) { const e = limpiarEmails(v); if (e.length) { email = e; origen = o; break; } }
+        for (const [o, v] of candidatos) { const e = limpiarEmails(v).filter(x => !DOMINIO_PROPIO.test(x)); if (e.length) { email = e; origen = o; break; } }
 
         const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
         const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
@@ -975,7 +1038,15 @@ module.exports = function montarReclamos(app, pool) {
         }));
       }
 
-      // Clientes sin reclamo: por regla de nombre (solapa "Sin reclamo") o excluidos con el tachito
+      // Diagnóstico: ver qué devuelve Colppy en los comentarios de un cliente
+  app.get('/api/reclamos/comentarios-test', admin, async (req, res) => {
+    try {
+      await pool.query(`DELETE FROM reclamos_comentarios WHERE id_cliente=$1`, [String(req.query.idCliente || '')]);
+      res.json(await colppyEmailsComentarios(String(req.query.idCliente || '')));
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Clientes sin reclamo: por regla de nombre (solapa "Sin reclamo") o excluidos con el tachito
       const reglasExcl = (await pool.query(`SELECT patron FROM reclamos_excluidos`)).rows.map(r => ({ patron: r.patron, banco: r.patron }));
       const excluidos = [];
       for (let i = mails.length - 1; i >= 0; i--) {
@@ -998,6 +1069,7 @@ module.exports = function montarReclamos(app, pool) {
         mails: mails.length,
         enviables: mails.filter(m => m.email.length && !m.bloqueado && !m.faltaUSD && !m.excluido).length,
         faltaUSD: mails.filter(m => m.faltaUSD).length,
+        errorComentarios: fallasComentarios ? `No se pudieron leer los comentarios de ${fallasComentarios} clientes: ${ultimoErrorComentarios}` : null,
         mora: mails.filter(m => m.tipoMail === 'mora').length,
         sinEmail: mails.filter(m => !m.email.length).length,
         totalARS: r2(mails.reduce((s, m) => s + m.totales.ARS, 0)),
@@ -1048,6 +1120,7 @@ module.exports = function montarReclamos(app, pool) {
         }
       }
       if (m.excluido) return res.status(400).json({ error: `${m.empresa} está excluido de los reclamos` });
+      to = to.filter(x => !DOMINIO_PROPIO.test(x));
       if (!to.length) return res.status(400).json({ error: `${m.empresa} no tiene email` });
       if (m.facturas.some(f => f.faltaUSD)) return res.status(400).json({ error: `${m.empresa}: falta cargar el monto USD de ${m.facturas.filter(f => f.faltaUSD).map(f => f.nro).join(', ')}` });
 
