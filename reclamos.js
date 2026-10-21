@@ -78,7 +78,8 @@ const claveEmpresa = s => String(s || '').trim().toLowerCase().replace(/\s+/g, '
 
 function parseUSD(desc) {
   const t = String(desc || '');
-  const m = t.match(/(\d[\d.,]*)\s*(?:usd|u\$s|us\$|d[oó]lares)/i) || t.match(/(?:usd|u\$s|us\$)\s*(\d[\d.,]*)/i);
+  // Primero "USD 15171" (número después); si no, "442 usd" (número antes). Evita tomar "Oficina 36 USD 15171" como 36.
+  const m = t.match(/(?:usd|u\$s|us\$)\s*:?\s*(\d[\d.,]*)/i) || t.match(/(\d[\d.,]*)\s*(?:usd|u\$s|us\$|d[oó]lares)/i);
   if (!m) return null;
   let s = m[1].replace(/[.,]$/, '');
   if (s.includes('.') && s.includes(',')) s = s.replace(/\./g, '').replace(',', '.');
@@ -723,6 +724,7 @@ module.exports = function montarReclamos(app, pool) {
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS excluido BOOLEAN DEFAULT FALSE;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS banco TEXT;
     ALTER TABLE reclamos_contactos ADD COLUMN IF NOT EXISTS empresa TEXT;
+    CREATE TABLE IF NOT EXISTS reclamos_montos (id_factura TEXT PRIMARY KEY, nro TEXT, moneda TEXT, importe NUMERIC, saldo_ars_ref NUMERIC, updated_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_excluidos (patron TEXT PRIMARY KEY, nota TEXT, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_bancos_reglas (patron TEXT PRIMARY KEY, banco TEXT NOT NULL, created_at TIMESTAMPTZ DEFAULT NOW());
     CREATE TABLE IF NOT EXISTS reclamos_intereses (id SERIAL PRIMARY KEY, id_factura TEXT, id_cliente TEXT, nro TEXT, moneda TEXT,
@@ -899,6 +901,17 @@ module.exports = function montarReclamos(app, pool) {
         }));
       }
       for (const c of porCliente.values()) c.facturas.forEach(f => aplicarMoneda(f, c.moneda));
+      // Montos editados a mano (se descartan si el saldo cambió en Colppy)
+      const editados = new Map((await pool.query(`SELECT id_factura, moneda, importe, saldo_ars_ref FROM reclamos_montos`)).rows.map(r => [r.id_factura, r]));
+      const descartar = [];
+      for (const c of porCliente.values()) for (const f of c.facturas) {
+        const e = editados.get(f.idFactura);
+        if (!e) continue;
+        if (Math.abs(+e.saldo_ars_ref - f.saldoARS) > 1) { descartar.push(f.idFactura); f.montoDescartado = true; continue; }
+        if (e.moneda !== f.moneda) continue;
+        f.importeColppy = f.importe; f.importe = +e.importe; f.montoEditado = true; f.faltaUSD = false;
+      }
+      if (descartar.length) await pool.query(`DELETE FROM reclamos_montos WHERE id_factura = ANY($1)`, [descartar]);
 
       // Emails guardados
       const [ovr, facEm, cliEm] = await Promise.all([
@@ -1204,6 +1217,35 @@ module.exports = function montarReclamos(app, pool) {
       await pool.query(`INSERT INTO pdfs_banco (tipo, nombre, url, public_id) VALUES ($1,$2,$3,$4)
         ON CONFLICT (tipo) DO UPDATE SET nombre=$2, url=$3, public_id=$4`, [tipo, req.file.originalname, result.secure_url, result.public_id]);
       res.json({ ok: true });
+    } catch (e) { res.status(500).json({ error: e.message }); }
+  });
+
+  // Editar el monto a reclamar de una factura (vacío = volver al de Colppy)
+  app.post('/api/reclamos/monto', admin, async (req, res) => {
+    try {
+      const { loteId, idCliente, idFactura } = req.body || {};
+      const r = await pool.query(`SELECT data FROM reclamos_lotes WHERE id=$1`, [loteId]);
+      if (!r.rows[0]) return res.status(404).json({ error: 'Lote no encontrado. Volvé a buscar facturas.' });
+      const mails = r.rows[0].data;
+      const m = mails.find(x => x.idCliente === idCliente);
+      const f = m?.facturas.find(x => x.idFactura === idFactura);
+      if (!f) return res.status(404).json({ error: 'Factura no está en el lote' });
+      const texto = String(req.body.importe ?? '').trim();
+      if (!texto) {
+        await pool.query(`DELETE FROM reclamos_montos WHERE id_factura=$1`, [idFactura]);
+        if (f.montoEditado) { f.importe = f.importeColppy ?? f.importe; f.montoEditado = false; }
+        if (f.moneda === 'USD' && !f.usdFactura) { f.faltaUSD = true; f.importe = 0; }
+      } else {
+        const v = parseUSD(`${texto} usd`);
+        if (v == null) return res.status(400).json({ error: 'Monto inválido' });
+        await pool.query(`INSERT INTO reclamos_montos (id_factura, nro, moneda, importe, saldo_ars_ref, updated_at) VALUES ($1,$2,$3,$4,$5,NOW())
+          ON CONFLICT (id_factura) DO UPDATE SET moneda=$3, importe=$4, saldo_ars_ref=$5, updated_at=NOW()`, [idFactura, f.nro, f.moneda, v, f.saldoARS]);
+        if (!f.montoEditado) f.importeColppy = f.importe;
+        f.importe = v; f.montoEditado = true; f.faltaUSD = false;
+      }
+      calcularTotales(m, await leerIPC(), hoyAR());
+      await pool.query(`UPDATE reclamos_lotes SET data=$2 WHERE id=$1`, [loteId, JSON.stringify(mails)]);
+      res.json({ ok: true, mail: m });
     } catch (e) { res.status(500).json({ error: e.message }); }
   });
 
