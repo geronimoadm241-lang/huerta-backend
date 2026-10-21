@@ -1048,10 +1048,12 @@ module.exports = function montarReclamos(app, pool) {
           ...(tieneUSD ? [['contacto USD', mFac.get(k)], ['clientes', mCli.get(k)]] : [['clientes', mCli.get(k)], ['facturas', mFac.get(k)]]),
         ];
         for (const [o, v] of candidatos) { const e = limpiarEmails(v).filter(x => !DOMINIO_PROPIO.test(x)); if (e.length) { email = e; origen = o; break; } }
+        const teniaPropio = !email.length && candidatos.some(([, v]) => limpiarEmails(v).some(x => DOMINIO_PROPIO.test(x)));
 
         const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
         const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
         const problemas = [];
+        if (teniaPropio) problemas.push('Tiene un email de Huerta cargado (no se usa): cargá el email real del cliente');
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
@@ -1105,7 +1107,7 @@ module.exports = function montarReclamos(app, pool) {
         mails: mails.length,
         enviables: mails.filter(m => m.email.length && !m.bloqueado && !m.faltaUSD && !m.excluido).length,
         faltaUSD: mails.filter(m => m.faltaUSD).length,
-        errorComentarios: fallasComentarios ? `No se pudieron leer los comentarios de ${fallasComentarios} clientes: ${ultimoErrorComentarios}` : null,
+        errorComentarios: (process.env.COLPPY_COMENTARIOS === '1' && fallasComentarios) ? `No se pudieron leer los comentarios de ${fallasComentarios} clientes: ${ultimoErrorComentarios}` : null,
         mora: mails.filter(m => m.tipoMail === 'mora').length,
         sinEmail: mails.filter(m => !m.email.length).length,
         totalARS: r2(mails.reduce((s, m) => s + m.totales.ARS, 0)),
