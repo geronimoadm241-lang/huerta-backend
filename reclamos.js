@@ -61,7 +61,7 @@ const LOTE_VALIDO_HORAS = 6;
 const TIPOS = {
   recordatorio: { label: 'Recordatorio día 8', asunto: () => 'Recordatorio de vencimiento · Huerta Coworking' },
   reclamo1: { label: 'Reclamo día 15', asunto: () => 'Factura pendiente de pago · Huerta Coworking' },
-  reclamo2: { label: 'Segundo aviso día 20', asunto: () => 'Segundo aviso · Factura pendiente · Huerta Coworking' },
+  reclamo2: { label: 'Segundo aviso día 20', asunto: () => 'Factura pendiente de pago · Huerta Coworking' },
   mora: { label: 'Mora +90 días', asunto: emp => `URGENTE: Deuda en mora · ${emp} · Cuenta en revisión` },
 };
 
@@ -498,9 +498,7 @@ function calcularTotales(m, ipc, hoy) {
 
 // ---------- Emails desde los comentarios del cliente en Colppy ----------
 const COLPPY_COMENTARIOS_URL = 'https://login.colppy.com/resources/php/common/listadoComentario.php';
-// Solo se bloquea la casilla que se usa como truco en Colppy para frenar sus avisos automáticos
-const DOMINIO_PROPIO = /^admin@huertacoworking\.com$/i;
-const EMAIL_INTERNO = /@huertacoworking\.com$/i;
+const DOMINIO_PROPIO = /@huertacoworking\.com$/i;
 let ultimoErrorComentarios = '';
 
 function emailsDeComentarios(texto) {
@@ -726,7 +724,7 @@ function armarHtml(c, adjuntos) {
     cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te contactamos porque registramos ${unaVarias('una factura impaga', `${n} facturas impagas`)} en tu cuenta. Te pedimos que regularices la situación a la brevedad.`)
       + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
   } else if (tipoMail === 'reclamo2') {
-    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te escribimos nuevamente porque ${unaVarias('la factura sigue impaga', `las ${n} facturas siguen impagas`)} a pesar de nuestro aviso anterior. Necesitamos que regularices la situación dentro de las próximas 48 horas.`)
+    cuerpo = p(`Hola ${esc(nombreSaludo(c))}, te contactamos porque registramos ${unaVarias('una factura impaga', `${n} facturas impagas`)} en tu cuenta. Te pedimos que regularices la situación a la brevedad.`)
       + p('Si ya realizaste el pago, por favor respondé este email con el comprobante. Quedamos a disposición.');
   } else {
     cuerpo = p(`Hola ${esc(nombreSaludo(c))}, la cuenta de ${esc(empresa)} registra facturas con más de ${DIAS_MORA} días de atraso y se encuentra en revisión.`)
@@ -1057,8 +1055,7 @@ module.exports = function montarReclamos(app, pool) {
         const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
         const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
         const problemas = [];
-        if (teniaPropio) problemas.push('Tiene admin@huertacoworking.com cargado (no se usa): cargá el email real del cliente');
-        if (email.some(x => EMAIL_INTERNO.test(x))) problemas.push('Email interno de Huerta: revisá que sea correcto');
+        if (teniaPropio) problemas.push('Tiene un email de Huerta cargado (no se usa): cargá el email real del cliente');
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
@@ -1155,7 +1152,7 @@ module.exports = function montarReclamos(app, pool) {
       let to = m.email;
       if (emailEditado != null) {
         const e = limpiarEmails(emailEditado).filter(x => !DOMINIO_PROPIO.test(x));
-        if (!e.length) return res.json({ ok: true, omitido: true, motivo: 'email inválido o admin@huertacoworking.com' });
+        if (!e.length) return res.json({ ok: true, omitido: true, motivo: 'email inválido o de Huerta' });
         if (e.join(',') !== m.email.join(',')) {
           to = e;
           await pool.query(`INSERT INTO reclamos_contactos (id_cliente, email, updated_at) VALUES ($1,$2,NOW())
@@ -1258,7 +1255,7 @@ module.exports = function montarReclamos(app, pool) {
       const cambios = {};
       if (req.body.email != null) {
         const todos = limpiarEmails(req.body.email);
-        if (todos.some(x => DOMINIO_PROPIO.test(x))) return res.status(400).json({ error: 'admin@huertacoworking.com no se puede usar como destinatario del reclamo. Cargá el email del cliente.' });
+        if (todos.some(x => DOMINIO_PROPIO.test(x))) return res.status(400).json({ error: 'No se puede usar un email de Huerta como destinatario del reclamo. Cargá el email del cliente.' });
         const e = todos;
         if (String(req.body.email).trim() && !e.length) return res.status(400).json({ error: 'Email inválido' });
         cambios.email = e.join(', '); m.email = e; m.emailOrigen = e.length ? 'editado' : '';
