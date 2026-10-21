@@ -522,18 +522,52 @@ function emailsDeComentarios(texto) {
   return deTexto(texto);
 }
 
+// La página de comentarios usa la sesión web (cookie). Se inicia sesión guardando las cookies como un navegador.
+let colppyCookie = null, colppyCookieTs = 0;
+function juntarCookies(r, previas = {}) {
+  const lista = typeof r.headers.getSetCookie === 'function' ? r.headers.getSetCookie() : [r.headers.get('set-cookie')].filter(Boolean);
+  for (const c of lista) { const [par] = c.split(';'); const i = par.indexOf('='); if (i > 0) previas[par.slice(0, i).trim()] = par.slice(i + 1).trim(); }
+  return previas;
+}
+const cookieTexto = o => Object.entries(o).map(([k, v]) => `${k}=${v}`).join('; ');
+
+async function colppySesionWeb(force = false) {
+  if (colppyCookie && !force && Date.now() - colppyCookieTs < 2 * 3600e3) return colppyCookie;
+  if (!process.env.COLPPY_PASS) throw new Error('Falta COLPPY_PASS');
+  let jar = {};
+  try { jar = juntarCookies(await fetch('https://login.colppy.com/', { headers: UA, redirect: 'manual' }), jar); } catch {}
+  const r = await fetch(COLPPY_URL, {
+    method: 'POST',
+    headers: { ...UA, 'Content-Type': 'application/json', Cookie: cookieTexto(jar), Origin: 'https://login.colppy.com', Referer: 'https://login.colppy.com/' },
+    body: JSON.stringify({
+      auth: { usuario: COLPPY_USER, password: md5(process.env.COLPPY_PASS) },
+      service: { provision: 'Usuario', operacion: 'iniciar_sesion' },
+      parameters: { usuario: COLPPY_USER, password: md5(process.env.COLPPY_PASS) },
+    }),
+  });
+  jar = juntarCookies(r, jar);
+  const d = await r.json().catch(() => ({}));
+  const clave = d?.response?.data?.claveSesion;
+  if (!Object.keys(jar).length) throw new Error('Colppy no devolvió cookie de sesión web');
+  colppyCookie = { cookie: cookieTexto(jar), claveSesion: clave };
+  colppyCookieTs = Date.now();
+  return colppyCookie;
+}
+
 async function colppyEmailsComentarios(idCliente) {
   for (const force of [false, true]) {
-    const s = await colppyGetSesion(force);
-    const body = new URLSearchParams({ idObjeto: String(idCliente), idEmpresa: COLPPY_ID_EMPRESA, idElemento: '3', usuario: s.usuario, claveSesion: s.claveSesion });
+    let web;
+    try { web = await colppySesionWeb(force); } catch (e) { ultimoErrorComentarios = e.message; continue; }
+    const params = { idObjeto: String(idCliente), idEmpresa: COLPPY_ID_EMPRESA, idElemento: '3' };
+    if (web.claveSesion) Object.assign(params, { usuario: COLPPY_USER, claveSesion: web.claveSesion });
     const ctrl = new AbortController(); const t = setTimeout(() => ctrl.abort(), 10000);
     try {
-      const r = await fetch(`${COLPPY_COMENTARIOS_URL}?${new URLSearchParams({ usuario: s.usuario, claveSesion: s.claveSesion })}`, {
-        method: 'POST', signal: ctrl.signal, body,
-        headers: { ...UA, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest' },
+      const r = await fetch(COLPPY_COMENTARIOS_URL, {
+        method: 'POST', signal: ctrl.signal, body: new URLSearchParams(params),
+        headers: { ...UA, Cookie: web.cookie, 'Content-Type': 'application/x-www-form-urlencoded; charset=UTF-8', 'Accept': 'application/json, text/plain, */*', 'X-Requested-With': 'XMLHttpRequest', Origin: 'https://login.colppy.com', Referer: 'https://login.colppy.com/' },
       });
       const texto = await r.text();
-      if (r.ok && !/<html|sesi[oó]n|login/i.test(texto.slice(0, 300))) { ultimoErrorComentarios = ''; return { ok: true, emails: emailsDeComentarios(texto), crudo: texto.slice(0, 600) }; }
+      if (r.ok && !/sesion no es v|<html|cerrar_sesion/i.test(texto.slice(0, 400))) { ultimoErrorComentarios = ''; return { ok: true, emails: emailsDeComentarios(texto), crudo: texto.slice(0, 600) }; }
       ultimoErrorComentarios = `HTTP ${r.status}: ${texto.slice(0, 200).replace(/\s+/g, ' ')}`;
     } catch (e) { ultimoErrorComentarios = e.name === 'AbortError' ? 'Colppy no respondió a tiempo' : e.message; }
     finally { clearTimeout(t); }
