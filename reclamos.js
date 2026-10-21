@@ -498,7 +498,9 @@ function calcularTotales(m, ipc, hoy) {
 
 // ---------- Emails desde los comentarios del cliente en Colppy ----------
 const COLPPY_COMENTARIOS_URL = 'https://login.colppy.com/resources/php/common/listadoComentario.php';
-const DOMINIO_PROPIO = /@huertacoworking\.com$/i;
+// Solo se bloquea la casilla que se usa como truco en Colppy para frenar sus avisos automáticos
+const DOMINIO_PROPIO = /^admin@huertacoworking\.com$/i;
+const EMAIL_INTERNO = /@huertacoworking\.com$/i;
 let ultimoErrorComentarios = '';
 
 function emailsDeComentarios(texto) {
@@ -1055,7 +1057,8 @@ module.exports = function montarReclamos(app, pool) {
         const sedes = [...new Set(facturas.map(f => sedeDePV(f.pv)).filter(Boolean))];
         const cc = [...new Set([...CC_FIJOS, ...sedes.map(s => s.cc)])];
         const problemas = [];
-        if (teniaPropio) problemas.push('Tiene un email de Huerta cargado (no se usa): cargá el email real del cliente');
+        if (teniaPropio) problemas.push('Tiene admin@huertacoworking.com cargado (no se usa): cargá el email real del cliente');
+        if (email.some(x => EMAIL_INTERNO.test(x))) problemas.push('Email interno de Huerta: revisá que sea correcto');
         if (yaEnviados.has(c.idCliente)) problemas.push(`Ya recibió un mail en las últimas ${HORAS_BLOQUEO_REENVIO} horas`);
 
         const mail = {
@@ -1151,18 +1154,18 @@ module.exports = function montarReclamos(app, pool) {
 
       let to = m.email;
       if (emailEditado != null) {
-        const e = limpiarEmails(emailEditado);
-        if (!e.length) return res.status(400).json({ error: `Email inválido para ${m.empresa}` });
+        const e = limpiarEmails(emailEditado).filter(x => !DOMINIO_PROPIO.test(x));
+        if (!e.length) return res.json({ ok: true, omitido: true, motivo: 'email inválido o admin@huertacoworking.com' });
         if (e.join(',') !== m.email.join(',')) {
           to = e;
           await pool.query(`INSERT INTO reclamos_contactos (id_cliente, email, updated_at) VALUES ($1,$2,NOW())
             ON CONFLICT (id_cliente) DO UPDATE SET email=$2, updated_at=NOW()`, [idCliente, e.join(', ')]);
         }
       }
-      if (m.excluido) return res.status(400).json({ error: `${m.empresa} está excluido de los reclamos` });
+      if (m.excluido) return res.json({ ok: true, omitido: true, motivo: 'está en Sin reclamo' });
       to = to.filter(x => !DOMINIO_PROPIO.test(x));
-      if (!to.length) return res.status(400).json({ error: `${m.empresa} no tiene email` });
-      if (m.facturas.some(f => f.faltaUSD)) return res.status(400).json({ error: `${m.empresa}: falta cargar el monto USD de ${m.facturas.filter(f => f.faltaUSD).map(f => f.nro).join(', ')}` });
+      if (!to.length) return res.json({ ok: true, omitido: true, motivo: 'no tiene email' });
+      if (m.facturas.some(f => f.faltaUSD)) return res.json({ ok: true, omitido: true, motivo: `falta el monto USD de ${m.facturas.filter(f => f.faltaUSD).map(f => f.nro).join(', ')}` });
 
       // Bloqueo de reenvío: mismo cliente en las últimas horas
       const rec = await pool.query(
@@ -1254,7 +1257,9 @@ module.exports = function montarReclamos(app, pool) {
       if (!m) return res.status(404).json({ error: 'Cliente no está en el lote' });
       const cambios = {};
       if (req.body.email != null) {
-        const e = limpiarEmails(req.body.email);
+        const todos = limpiarEmails(req.body.email);
+        if (todos.some(x => DOMINIO_PROPIO.test(x))) return res.status(400).json({ error: 'admin@huertacoworking.com no se puede usar como destinatario del reclamo. Cargá el email del cliente.' });
+        const e = todos;
         if (String(req.body.email).trim() && !e.length) return res.status(400).json({ error: 'Email inválido' });
         cambios.email = e.join(', '); m.email = e; m.emailOrigen = e.length ? 'editado' : '';
       }
