@@ -42,12 +42,14 @@ function bancoPorRegla(empresa, reglas) {
 const LETRAS = { '0': 'A', '1': 'B', '5': 'I', '6': 'M', '7': 'X', '8': 'T' };
 const SIEMPRE_USD = ['T', 'I', 'M'];
 const DIA_VENCIMIENTO = 10;
-// Vence el día 10 del mes de emisión (o del mes siguiente si se emitió después del 10)
+// Emitidas del 1 al 10: vencen el día 10 (facturación mensual).
+// Emitidas después del 10: no son mensuales, vencen a los pocos días de emitidas.
+const DIAS_PAGO_FUERA_DE_CICLO = +(process.env.DIAS_PAGO_FUERA_DE_CICLO || 4);
 function vencimientoDia10(emision, fechaColppy) {
   const [y, m, d] = emision.split('-').map(Number);
-  let vy = y, vm = m;
-  if (d > DIA_VENCIMIENTO) { vm++; if (vm > 12) { vm = 1; vy++; } }
-  const v = `${vy}-${String(vm).padStart(2, '0')}-${String(DIA_VENCIMIENTO).padStart(2, '0')}`;
+  let v;
+  if (d <= DIA_VENCIMIENTO) v = `${y}-${String(m).padStart(2, '0')}-${String(DIA_VENCIMIENTO).padStart(2, '0')}`;
+  else v = new Date(Date.UTC(y, m - 1, d + DIAS_PAGO_FUERA_DE_CICLO)).toISOString().slice(0, 10);
   return fechaColppy && fechaColppy > v ? fechaColppy : v;
 }
 const DIAS_MORA = 90;
