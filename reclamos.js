@@ -1014,7 +1014,9 @@ module.exports = function montarReclamos(app, pool) {
 
       // Emails de los comentarios de Colppy (caché de 6 horas)
       const cache = new Map((await pool.query(`SELECT id_cliente, emails FROM reclamos_comentarios WHERE ts > NOW() - interval '6 hours'`)).rows.map(r => [r.id_cliente, r.emails]));
-      const pedir = [...porCliente.keys()].filter(id => !cache.has(id));
+      // Desactivado: Colppy no permite leer los comentarios desde el servidor (solo con la sesión del navegador).
+      // Se puede reactivar con la variable COLPPY_COMENTARIOS=1 si Colppy lo habilita.
+      const pedir = process.env.COLPPY_COMENTARIOS === '1' ? [...porCliente.keys()].filter(id => !cache.has(id)) : [];
       let fallasComentarios = 0;
       for (let i = 0; i < pedir.length; i += 8) {
         await Promise.all(pedir.slice(i, i + 8).map(async id => {
